@@ -34,8 +34,13 @@
 - **路由**：加一条到虚拟网段（如 `10.0.0.0/24`）的路由，下一跳指向虚拟网卡。
 - **封装**：从网卡读帧（L2）或 IP 包（L3）→ 塞进加密 UDP 隧道 → 对端解包写回自己的网卡。
 
-### 3. 加密
-Noise / WireGuard 模式做密钥协商与数据加密，顺带做「好友白名单」（只有交换过密钥的机器能连）。
+### 3. 加密（M6a 已实现，纯 stdlib）
+- **身份**：每台机器一个 X25519 长时密钥对（`internal/crypto`，`LoadOrCreate` 持久化到 `%AppData%\Eliauk\identity.key`），base64 指纹即「好友 ID」。
+- **握手**：hello/helloAck 各带 64B（ephemeral 32 || static 32）。**无 initiator/responder 之分**（同时打洞双方都跑 responder 逻辑）→ 会话派生**角色无关**：三个对称 DH 排序取规范 IKM + 四个公钥排序取规范 transcript，HKDF-SHA256 派生 32B 会话密钥。
+- **每连接一个 ephemeral**：`BeginConnect` 生成一次，握手与派生共用；responder 绝不重生成（重生成会导致双方 ephemeral 组合分叉 → 会话不一致 → GCM 鉴权失败）。
+- **数据加密**：AES-256-GCM（`crypto/aes`+`crypto/cipher`，不是 chacha20poly1305——那在 x/crypto）。8B 计数器 nonce + 64 包重放窗口，AAD 绑定 peer 对。
+- **好友白名单（M6b）**：`--friends` 文件列 base64 指纹；未在白名单的静态密钥直接拒绝握手；其密文在 frameData 层被 drop-guard 丢弃（堵住不对称白名单下「密文当明文转发」）。
+- 有身份 client 拒绝与无身份（legacy 明文）peer 连接 —— 禁止静默降级。
 
 ### 4. 广播模拟（M5，已实现）
 Wintun 是 L3 无广播 → MC 局域网发现（UDP 224.0.2.60:4445）在软件层模拟：
@@ -66,7 +71,9 @@ Wintun 是 L3 无广播 → MC 局域网发现（UDP 224.0.2.60:4445）在软件
 - [x] **M3** TURN 中继回退（打洞失败时流量走服务器）
 - [x] **M4** 虚拟网卡打通（绑定 Wintun，虚拟 IP 分配 + 自动连接 + 数据面送达）
 - [x] **M5** 游戏链路（MC 局域网发现端到端经隧道验证：4445 嗅探 → 源改写为 VIP → SendDataBroadcast → dataSink 双路注入；每 peer /32 路由强制走隧道；mcprobe 假 MC 端到端 + `--debug-packets` 双向实锤）
-- [ ] **M6** 加密（Noise）+ 好友白名单 + GUI 托盘（Windows 桌面）
+- [x] **M6a** 加密层（X25519 身份 + 角色无关会话派生 + AES-256-GCM 数据加密；纯 stdlib；同机双客户端 e2e 验证）
+- [x] **M6b** 好友白名单（`--friends` 指纹白名单 + checkPeerStatic 拒绝 + frameData drop-guard；e2e 验证被拒方数据被丢）
+- [x] **M6c** Windows 托盘 GUI（`internal/agent` 共享内核 + `internal/tray` 纯 Win32 托盘 + `cmd/gui`；双托盘 e2e 通过）—— **M6 全部完成**
 - [ ] **M9** 跨机验证（真实双机跑 mcprobe，覆盖真实 NAT 打洞；同机已验证通过）
 
 ## 技术栈（已确定 ✅）
@@ -75,16 +82,22 @@ Wintun 是 L3 无广播 → MC 局域网发现（UDP 224.0.2.60:4445）在软件
 - **广播/ARP**：Wintun 无广播 → 软件层模拟广播转发（MC 局域网发现依赖）
 - **异步**：标准库 + goroutine
 - **协调服务器**：WebSocket + 轻量 HTTP，可部署在任何云 VPS
-- **加密库**：`golang.org/x/crypto` 或复用 wireguard-go（M6 前定具体方案）
+- **加密库**：纯 **stdlib**（`crypto/ecdh` X25519 + `crypto/hkdf` + `crypto/aes`/`crypto/cipher` AES-256-GCM）——M6a 已落地，零新依赖
+- **GUI（M6c，已实现）**：`internal/tray` 纯 Win32（`syscall.NewLazyDLL` 直调 user32/shell32，零新依赖）+ `cmd/gui`；`internal/agent` 抽共享内核供 CLI/GUI 复用
 
 ## 已定决策
 - ✅ 语言：**Go**
 - ✅ 驱动：**Wintun**（L3，软件层模拟广播）
 
+## 已定决策（M6 追加）
+- ✅ 加密方案：**X25519 + HKDF + AES-256-GCM**（纯 stdlib，角色无关会话派生）
+- ✅ 好友身份机制：**密钥白名单**（`--friends` base64 指纹文件），非账号系统
+- ✅ GUI 方案：**纯 Win32**（`internal/tray`，`syscall.NewLazyDLL`，零新依赖）——放弃 `getlantern/systray`（引入第三方依赖）
+- ✅ 架构：**`internal/agent` 共享内核**——CLI 与 GUI 同一份实现，UI 只是壳
+
 ## 待决策（剩余）
-- 虚拟 IP 网段与分配方式（写死 vs 协调服务器动态分配）
+- 虚拟 IP 网段与分配方式（写死 vs 协调服务器动态分配）——已用协调服务器动态分配（10.0.0.x），无争议
 - 协调服务器部署方案（哪家 VPS / 域名）
-- 好友身份机制（账号系统？还是密钥白名单？M6 前定）
 
 ## 项目信息
 - 创建日期：2026-08-31
