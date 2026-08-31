@@ -37,7 +37,13 @@ func Detect(primary, secondary *net.UDPAddr, timeout time.Duration) (*Result, er
 		return nil, fmt.Errorf("stun: open udp socket: %w", err)
 	}
 	defer conn.Close()
+	return DetectOn(conn, primary, secondary, timeout)
+}
 
+// DetectOn runs the probe on an existing socket. The mapped address is only
+// valid for THAT socket — hole punching must be done on the same socket whose
+// mapping we advertise.
+func DetectOn(conn *net.UDPConn, primary, secondary *net.UDPAddr, timeout time.Duration) (*Result, error) {
 	// Baseline mapped address from the primary server.
 	m1, err := roundTrip(conn, primary, false, false, timeout)
 	if err != nil {

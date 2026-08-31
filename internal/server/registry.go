@@ -26,6 +26,7 @@ type Client struct {
 	PublicIP   string
 	PublicPort int
 	NATType    string
+	Candidates []protocol.Candidate
 	Conn       *websocket.Conn
 	writeMu    sync.Mutex // serializes writes so broadcasts don't interleave
 }
@@ -75,14 +76,16 @@ func (r *Registry) Remove(id string) {
 	delete(r.clients, id)
 }
 
-// UpdateEndpoint records the public endpoint a client reported via STUN.
-func (r *Registry) UpdateEndpoint(id, publicIP string, publicPort int, natType string) {
+// UpdateEndpoint records the public endpoint a client reported via STUN plus
+// its punch candidates.
+func (r *Registry) UpdateEndpoint(id, publicIP string, publicPort int, natType string, candidates []protocol.Candidate) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if c, ok := r.clients[id]; ok {
 		c.PublicIP = publicIP
 		c.PublicPort = publicPort
 		c.NATType = natType
+		c.Candidates = candidates
 	}
 }
 
@@ -106,6 +109,24 @@ func (r *Registry) Peers(excludeID string) []protocol.Peer {
 		})
 	}
 	return peers
+}
+
+// Client returns the client with the given id.
+func (r *Registry) Client(id string) (*Client, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.clients[id]
+	return c, ok
+}
+
+// Candidates returns the punch candidates reported by a client.
+func (r *Registry) Candidates(id string) []protocol.Candidate {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c, ok := r.clients[id]; ok {
+		return c.Candidates
+	}
+	return nil
 }
 
 // All returns every connected client.

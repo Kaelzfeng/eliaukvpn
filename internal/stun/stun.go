@@ -144,6 +144,11 @@ func roundTrip(conn *net.UDPConn, server *net.UDPAddr, changeIP, changePort bool
 	if err != nil {
 		return nil, err
 	}
+	// Never leave a read deadline behind. The socket we probe on is the same
+	// socket the p2p tunnel later reads from, and a stale deadline would make
+	// Run() exit with an i/o timeout the first time it blocks. Clear it on
+	// every exit path.
+	defer conn.SetReadDeadline(time.Time{})
 	if _, err := conn.WriteToUDP(buildBindingRequest(txID, changeIP, changePort), server); err != nil {
 		return nil, err
 	}

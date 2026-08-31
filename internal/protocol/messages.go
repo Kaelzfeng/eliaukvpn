@@ -12,12 +12,14 @@ type Envelope struct {
 
 // Message type constants.
 const (
-	TypeRegister       = "register"        // client -> server
-	TypeRegistered     = "registered"      // server -> client
-	TypeReportEndpoint = "report_endpoint" // client -> server
-	TypeListPeers      = "list_peers"      // client -> server
-	TypePeersList      = "peers_list"      // server -> client
-	TypeError          = "error"           // server -> client
+	TypeRegister          = "register"           // client -> server
+	TypeRegistered        = "registered"         // server -> client
+	TypeReportEndpoint    = "report_endpoint"    // client -> server
+	TypeListPeers         = "list_peers"         // client -> server
+	TypePeersList         = "peers_list"         // server -> client
+	TypeConnectRequest    = "connect_request"    // client -> server
+	TypeConnectCandidates = "connect_candidates" // server -> both peers
+	TypeError             = "error"              // server -> client
 )
 
 // RegisterRequest is the first message a client sends.
@@ -32,11 +34,33 @@ type Registered struct {
 	Peers     []Peer `json:"peers"`
 }
 
-// ReportEndpoint carries the result of the client's STUN probe.
+// Candidate is one punchable address (public or LAN) of a client.
+type Candidate struct {
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+	Type string `json:"type"` // "public" | "lan"
+}
+
+// ReportEndpoint carries the result of the client's STUN probe plus the
+// punch candidates for this socket.
 type ReportEndpoint struct {
-	PublicIP   string `json:"public_ip"`
-	PublicPort int    `json:"public_port"`
-	NATType    string `json:"nat_type"`
+	PublicIP   string      `json:"public_ip"`
+	PublicPort int         `json:"public_port"`
+	NATType    string      `json:"nat_type"`
+	Candidates []Candidate `json:"candidates"`
+}
+
+// ConnectRequest asks the server to connect us to another peer.
+type ConnectRequest struct {
+	PeerID string `json:"peer_id"`
+}
+
+// ConnectCandidates is sent by the server to both sides of a requested
+// connection, carrying the other side's punch candidates.
+type ConnectCandidates struct {
+	PeerID     string      `json:"peer_id"`
+	PeerName   string      `json:"peer_name"`
+	Candidates []Candidate `json:"candidates"`
 }
 
 // PeersList is a full refresh of the online peer list.

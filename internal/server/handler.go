@@ -75,15 +75,53 @@ func HandleWS(reg *Registry, w http.ResponseWriter, r *http.Request) {
 			if err := json.Unmarshal(env.Data, &ep); err != nil {
 				continue
 			}
-			reg.UpdateEndpoint(client.ID, ep.PublicIP, ep.PublicPort, ep.NATType)
+			reg.UpdateEndpoint(client.ID, ep.PublicIP, ep.PublicPort, ep.NATType, ep.Candidates)
 			log.Printf("client %s endpoint: %s (%s)", client.ID, ep.PublicIP, ep.NATType)
 			broadcastPeers(reg)
 		case protocol.TypeListPeers:
 			_ = sendClient(client, protocol.TypePeersList, protocol.PeersList{Peers: reg.Peers(client.ID)})
+		case protocol.TypeConnectRequest:
+			handleConnectRequest(reg, client, env.Data)
 		default:
 			log.Printf("unknown message type %q from %s", env.Type, client.ID)
 		}
 	}
+}
+
+// handleConnectRequest wires two clients together for hole punching: both
+// sides receive the other's punch candidates and start punching on their own.
+func handleConnectRequest(reg *Registry, client *Client, data json.RawMessage) {
+	var req protocol.ConnectRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		sendClient(client, protocol.TypeError, protocol.Error{Message: "bad connect_request"})
+		return
+	}
+	target, ok := reg.Client(req.PeerID)
+	if !ok {
+		sendClient(client, protocol.TypeError, protocol.Error{Message: "peer not found: " + req.PeerID})
+		return
+	}
+	if target.ID == client.ID {
+		sendClient(client, protocol.TypeError, protocol.Error{Message: "cannot connect to yourself"})
+		return
+	}
+	srcCands := reg.Candidates(client.ID)
+	dstCands := reg.Candidates(target.ID)
+	if len(srcCands) == 0 || len(dstCands) == 0 {
+		sendClient(client, protocol.TypeError, protocol.Error{Message: "peer has not reported candidates yet"})
+		return
+	}
+	_ = sendClient(client, protocol.TypeConnectCandidates, protocol.ConnectCandidates{
+		PeerID:     target.ID,
+		PeerName:   target.Name,
+		Candidates: dstCands,
+	})
+	_ = sendClient(target, protocol.TypeConnectCandidates, protocol.ConnectCandidates{
+		PeerID:     client.ID,
+		PeerName:   client.Name,
+		Candidates: srcCands,
+	})
+	log.Printf("punch: %s(%s) <-> %s(%s)", client.Name, client.ID, target.Name, target.ID)
 }
 
 // sendClient writes an envelope to one client, serialized by the client's
