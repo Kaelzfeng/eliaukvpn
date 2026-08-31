@@ -68,7 +68,7 @@ func TestNotifyIconDataLayout(t *testing.T) {
 }
 
 func TestMakeIconICO(t *testing.T) {
-	ico := makeIconICO()
+	ico := IconICO()
 	// ICONDIR: reserved(2)=0, type(2)=1, count(2)=1
 	if binary.LittleEndian.Uint16(ico[0:2]) != 0 || binary.LittleEndian.Uint16(ico[2:4]) != 1 || binary.LittleEndian.Uint16(ico[4:6]) != 1 {
 		t.Fatalf("bad ICONDIR: % x", ico[:6])

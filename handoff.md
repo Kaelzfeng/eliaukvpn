@@ -21,6 +21,7 @@
 - [x] **M6a 完成（2026-08-31）**：加密层 — X25519 身份 + 角色无关会话派生 + **AES-256-GCM** 数据加密（纯 stdlib，无新依赖），同机双客户端经公网 hairpin 加密隧道 e2e 验证（session 双向建立、mcprobe 走加密隧道零鉴权失败）
 - [x] **M6b 完成（2026-08-31）**：好友白名单 — 只允许白名单内的静态密钥建立会话；未在白名单的 peer 双向被拒 + 其数据帧被丢弃（含不对称白名单场景的 drop-guard）
 - [x] **M6c 完成（2026-08-31）**：Windows 托盘 GUI — 纯 Win32（`syscall.NewLazyDLL`，零新依赖）托盘图标 + 右键状态菜单（身份/VIP/NAT/peers 连接状态/退出），包住 headless agent；`cmd/gui` 与 `cmd/client` 共享 `internal/agent` 内核，双托盘实例 e2e（加密会话 + 数据面 + 退出钩子）验证通过
+- [x] **M6d 完成（2026-08-31）**：傻瓜式主窗口 GUI — 双击即用、零命令行参数；主窗口（昵称/服务器/好友码/好友列表/状态/设置）+ 托盘同泵，配置持久化 `%AppData%\Eliauk\config.json`，UAC 提权自重启，设置变更自动重建 agent 重连；`cmd/genident` 工具 + `e2e-gui.ps1` 全自动双 GUI 脚本 e2e 全绿（注册/会话/数据面/干净退出）
 
 ## M2 详情（含踩坑）
 - 架构：协调服务器交换 candidates（`connect_request` → 双向 `connect_candidates`），双方在同一 socket 上各自打洞。
@@ -68,10 +69,9 @@
   `go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网IP>:9091`
   （注意：本机 8080/8081 被遗留进程占用，测试一律用 9090/9091。）
 - **交互式 CLI 客户端**（调试打洞用）：`bin/client.exe -name host -server ws://<server>:9090/ws [-vnic]`
-- **托盘 GUI**（正式使用）：`bin/gui.exe -name host -server ws://<server>:9090/ws`
-  （release 无控制台版：`go build -ldflags "-H windowsgui" ./cmd/gui`）
-- **首次使用**：启动即自动生成 `%AppData%\Eliauk\identity.key`（X25519），打印 base64 指纹。
-  **互加好友**：把对方的指纹写进 `--friends` 文件（每行一个，`#` 注释）——只有白名单内的指纹能建会话。
+- **傻瓜式 GUI**（正式使用，M6d）：双击 `bin/gui.exe` 即可。首次使用在主窗口填「昵称」+「服务器地址」（形如 `ws://主机:9090/ws`）点「保存并连接」；好友码点「复制」发给朋友，朋友粘贴到「添加好友」框即可互相连接。设置与好友持久化到 `%AppData%\Eliauk\config.json`（`-config` 可覆盖路径），X25519 身份在 `identity.key`。GUI 默认尝试 UAC 提权自重启以建虚拟网卡（`-no-elevate` 跳过）。release 无控制台版：`go build -ldflags "-H windowsgui" ./cmd/gui`。
+  **自动化钩子**（测试用）：`-exit-after <dur>` 到时自动退出；`-vnic-name` 指定网卡名；`-debug-packets` 打数据面日志。`cmd/genident <keyfile>` 打印/生成身份指纹（e2e 脚本用）。
+- **CLI 一键互连（不带 GUI，测试白名单用）**：`cmd/genident` 生成两端指纹 → 各自写 `--friends` 文件（每行一个指纹，`#` 注释）→ `bin/client.exe -name host -server ws://… -vnic --friends friends.txt`。
 - **M9 跨机验证步骤**（真机双端）：
   1. 每台机器装同一 `gui.exe` 或 `client.exe` + 各自的 keyfile；
   2. 互加好友白名单；3. 一台开 MC 局域网房（或 `mcprobe.exe -mode server`），另一台 `mcprobe.exe -mode client` 应看到 `discovered world ... at <hostVIP> (port 25565)` 且 `TCP connect OK`；
@@ -84,6 +84,15 @@
 - **`cmd/gui`**：1s ticker 重建托盘菜单（身份/VIP/Public/NAT/Identity/Friends + Peers 子菜单 + 退出）；`-exit-after <dur>` 是自动化测试钩子（真机弹两个托盘图标，跑完自动退出）。
 - **验证**：双 `gui.exe`（host+join，互白名单，`-debug-packets`）同机经公网 hairpin 直连 —— 双方注册、建虚拟网卡（wintun 顺手清了残留的 Eliauk-join/eve/host 1 孤儿适配器）、`session established`、`vnic->tunnel` 数据帧双向流动、`tunnel RTT≈250ms`、退出钩子干净退出（exit 0）。CLI 交互模式回归通过（peers/status/quit）。
 - 备注：release 构建用 `go build -ldflags "-H windowsgui" ./cmd/gui` 隐藏控制台；dev 直接跑（有控制台看日志）。
+
+## M6d 详情（傻瓜式主窗口 GUI，已 e2e 验证）
+- **架构**：`cmd/gui` 重写为「一个窗口 + 一个托盘 + 一个 agent 生命周期」。主窗口（`internal/window`）是纯 Win32 原生控件窗口（STATIC/EDIT/BUTTON/LISTBOX + 分组框，系统字体，520×566 固定），由 `win.Run()` 独享 UI 线程消息泵；`window.SetView` 用 PostMessage(wmRefresh) 把渲染模型跨 goroutine 送到 UI 线程；用户动作从 `win.Events()` 读。托盘（`internal/tray.NewOnWindow`）挂同一个窗口，`MsgHook` 在 wndProc 前截获 `tray.CallbackMsg`（0x8001，LDblClk→Show 窗口，其余→HandleTrayMsg）。
+- **消息槽位**：`window.wmRefresh = wmApp+3`（0x8003），**不是** wmApp+1 —— 0x8001 被托盘回调占用且被 MsgHook 先截，同值会被吞掉导致窗口永不刷新（已踩坑修复）。
+- **生命周期**：`agentLoop` 无设置时空闲等 `restartCh`；有设置则 `agent.New`→`Run`→出错 3s 自动重连；`signalRestart`（保存设置）取消当前 agent 并在 `restartCh` 排队重建（带 stale-agent 丢弃：dial 期间设置变了就关掉刚建的）。`tickLoop` 每秒 SetView + 更新托盘 tooltip。主 select 循环同泵 `win.Events`/`selCh`（托盘菜单转发）/`exitTimer`（`-exit-after`）/`quitCh`。
+- **配置驱动**：`config.Load` 读 `config.json`（昵称/服务器/好友列表）；`-name`/`-server` 仅测试用覆盖。`crypto.LoadOrCreate` 启动即载身份 → 好友码在连接前就显示。UAC：非提权且未 `-no-elevate` → `RelaunchElevated`（同命令行提权重启，原进程退出；用户拒了则无虚拟网卡继续跑并显示红字）。
+- **`internal/window` 的 uintptr→unsafe.Pointer 坑**：`GlobalLock`/`GetCommandLineW` 返回的指针装进 uintptr，`go vet` 拒绝一切直接转换（含包装函数）→ 用标准 launder 惯用法 `*(*unsafe.Pointer)(unsafe.Pointer(&p))` 再 `unsafe.Slice`。控制台窗口 GetCommandLineW 单缓冲没问题（提权重启用同命令行）。
+- **`cmd/genident <keyfile>`**：载入/创建 X25519 身份并打印 base64 指纹 —— 让 e2e 脚本和想预生成 keyfile 的用户不用先跑 GUI。
+- **e2e 验证**（`e2e-gui.ps1` 全自动，等价 bash 编排全绿）：只预写 host/join 两个 `config.json`（互指对方指纹）+ `-exit-after`，双击式启动两个 `gui.exe`（各自 `-vnic-name Eliauk-e2eh/-e2ej`）→ 双方 `registered`（10.0.0.4/10.0.0.5）→ `session established` → mcprobe 数据面（client 发现 `at 10.0.0.4 (port 25565)` + `TCP connect OK`，server `TCP accepted from 10.0.0.5`，`vnic->tunnel`/`tunnel->vnic` 双向实锤）→ 退出码 0/0，config/identity 落盘。脚本 finally 清理：杀进程、删 Eliauk-e2e* 适配器、删 workspace。
 
 ## M6a 详情（加密层，已 e2e 验证）
 - 架构：`internal/crypto`（纯 stdlib）+ `internal/p2p` 集成。长时 X25519 身份 `Identity`（`LoadOrCreate` 持久化到 `%AppData%\Eliauk\identity.key`，0600），启动打印 base64 指纹供好友白名单。
@@ -107,13 +116,14 @@
 3. ~~M3~~ ✅ **完成**
 4. ~~M4~~ ✅ **完成**
 5. ~~M5~~ ✅ **完成**（MC 局域网发现经隧道端到端验证通过，含 /32 路由 + BuildDiscovery + 双向 debug 实锤）
-6. **M6 已完成** ✅：M6a（加密）+ M6b（白名单）+ M6c（托盘 GUI）全部落地并 e2e 验证 —— **核心里程碑收官**
-7. **M9 跨机验证**（下一步）：真机双端跑 `mcprobe`，确认发现 + TCP 走公网隧道（同机已验证，跨机是最终确认；顺带覆盖真实 NAT 打洞）
-8. 待定：协调服务器 VPS 选型、`ensurePeerRoute` 的对端下线路由清理（目前 route 只加不删，peer 下线后 VIP 包会发向已失效 peer 被丢弃——对 M5 无碍）
+6. **M6 已完成** ✅：M6a（加密）+ M6b（白名单）+ M6c（托盘 GUI）+ M6d（傻瓜式主窗口 GUI）全部落地并 e2e 验证 —— **核心里程碑收官**
+7. **M9 跨机验证**（下一步）：真机双端跑 `gui.exe`（双击式，互加好友码）或 `mcprobe`，确认发现 + TCP 走公网隧道（同机已验证，跨机是最终确认；顺带覆盖真实 NAT 打洞）
+8. 待定：协调服务器 VPS 选型（用户说「vps最后再搞」）、`ensurePeerRoute` 的对端下线路由清理（目前 route 只加不删，peer 下线后 VIP 包会发向已失效 peer 被丢弃——对 M5 无碍）
+9. **新方向（2026-08-31，用户提出）**：像 MCTier 一样 —— 服务器端账号/好友/房间模型 + 一键加入 + 在线状态 + 可选游戏启动器集成，替代裸指纹互加好友。待与用户确认范围后规划。
 
 ## 里程碑速览
 M0 文档 ✅ → M1 协调服务器/STUN ✅ → M2 打洞直连 ✅ → M3 中继回退 ✅ → M4 虚拟网卡打通 ✅ → M5 游戏链路（MC 局域网发现）✅
-→ M6 加密(✅ M6a)+好友白名单(✅ M6b)+GUI(✅ M6c) **全部完成** → M9 跨机验证
+→ M6 加密(✅ M6a)+好友白名单(✅ M6b)+托盘GUI(✅ M6c)+傻瓜式主窗口GUI(✅ M6d) **全部完成** → M9 跨机验证 → 待定 MCTier 式账号/房间（新方向）
 
 ## 环境备注
 - Windows 11，开发机；Go 在 `C:\Program Files\Go\bin\go.exe`（新 shell 需用全路径或重设 `$env:Path`）。

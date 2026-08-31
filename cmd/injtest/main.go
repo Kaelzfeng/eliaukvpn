@@ -84,12 +84,12 @@ func main() {
 	ownAddr := [4]byte{10, 99, 0, 2}
 	nonlocal := [4]byte{10, 99, 0, 99}
 	type variant struct {
-		name       string
-		src        [4]byte
-		dst        [4]byte
-		sport      int
-		dport      int
-		payload    []byte
+		name    string
+		src     [4]byte
+		dst     [4]byte
+		sport   int
+		dport   int
+		payload []byte
 	}
 	tests := []variant{
 		{"same-subnet peer -> own IP", peer, ownAddr, 1234, 5555, []byte("AAA")},

@@ -7,13 +7,14 @@ import (
 	"encoding/binary"
 )
 
-// makeIconICO renders a 32x32 tray icon in memory as a single-image ICO
+// IconICO renders the Eliauk icon in memory as a single-image ICO
 // (green disc with a white "E", stylized like a network node) and returns the
 // ICO file bytes. No binary assets are shipped; the icon is drawn at startup.
+// Used for both the tray icon and the main window's taskbar icon.
 //
 // ICO layout: ICONDIR (6 B) + one ICONDIRENTRY (16 B) + a 32-bit BGRA DIB
 // (BITMAPINFOHEADER + pixel rows bottom-up) + a 1-bit AND mask.
-func makeIconICO() []byte {
+func IconICO() []byte {
 	const size = 32
 	const cx, cy = 15.5, 15.5 // center
 	const radius = 13.5

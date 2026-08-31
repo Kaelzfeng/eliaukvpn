@@ -8,6 +8,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -42,6 +43,10 @@ type Options struct {
 	DebugPackets  bool
 	Keyfile       string
 	FriendsFile   string
+	// Friends is the allowlist as raw 32-byte X25519 public keys, used by the
+	// GUI (which manages friends in its config) instead of a friends file.
+	// If FriendsFile is set it takes precedence.
+	Friends [][]byte
 	// Info prints user-facing progress lines (identity, registration,
 	// endpoints). Logf prints warnings and diagnostics.
 	Info func(format string, args ...any)
@@ -58,6 +63,10 @@ type Status struct {
 	Identity   string
 	FriendCt   int
 	Registered bool
+	// VnicMsg is non-empty when the virtual NIC could not be created (the
+	// process was not elevated, the Wintun driver is missing, etc.). The GUI
+	// shows it prominently instead of silently continuing without a NIC.
+	VnicMsg string
 }
 
 // Agent is one running client core.
@@ -79,6 +88,8 @@ type Agent struct {
 	friends  [][]byte
 	probe    *stun.Result
 	p2pConn  *net.UDPConn
+
+	vnicErr string
 
 	wsErr chan error
 }
@@ -139,6 +150,10 @@ func New(opts Options) (*Agent, error) {
 			return nil, fmt.Errorf("read friends list: %w", err)
 		}
 		f.Close()
+		opts.Info("friends         : %d allowed", len(friends))
+	} else if len(opts.Friends) > 0 {
+		// GUI mode: friends come from the config, already parsed.
+		friends = append(friends, opts.Friends...)
 		opts.Info("friends         : %d allowed", len(friends))
 	}
 
@@ -217,6 +232,7 @@ func (a *Agent) Status() Status {
 			st.Public = fmt.Sprintf("%s:%d", a.probe.Mapped.IP, a.probe.Mapped.Port)
 		}
 	}
+	st.VnicMsg = a.vnicErr
 	return st
 }
 
@@ -254,6 +270,75 @@ func (a *Agent) Connect(nameOrID string) error {
 		return fmt.Errorf("send connect_request: %w", err)
 	}
 	return nil
+}
+
+// Friends returns the current allowlist as base64 fingerprints (the same
+// strings the user pastes when adding a friend).
+func (a *Agent) Friends() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, 0, len(a.friends))
+	for _, k := range a.friends {
+		out = append(out, base64.StdEncoding.EncodeToString(k))
+	}
+	return out
+}
+
+// AddFriend validates and appends a fingerprint to the allowlist, then
+// re-syncs the tunnel's whitelist immediately (M6b). It is idempotent: adding
+// an existing friend is a no-op. Safe to call before registration — the tunnel
+// picks the updated list up when it is created.
+func (a *Agent) AddFriend(fp string) error {
+	raw, err := crypto.ParseFingerprint(fp)
+	if err != nil {
+		return fmt.Errorf("invalid friend code: %w", err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	want := base64.StdEncoding.EncodeToString(raw)
+	for _, k := range a.friends {
+		if base64.StdEncoding.EncodeToString(k) == want {
+			return nil // already a friend
+		}
+	}
+	a.friends = append(a.friends, raw)
+	a.syncFriendsLocked()
+	if a.opts.Info != nil {
+		a.opts.Info("friends         : %d allowed", len(a.friends))
+	}
+	return nil
+}
+
+// RemoveFriend deletes a fingerprint from the allowlist and re-syncs the
+// tunnel. An already-established session is not torn down (the whitelist is
+// enforced at handshake time); future connections are refused.
+func (a *Agent) RemoveFriend(fp string) error {
+	raw, err := crypto.ParseFingerprint(fp)
+	if err != nil {
+		return fmt.Errorf("invalid friend code: %w", err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	want := base64.StdEncoding.EncodeToString(raw)
+	for i, k := range a.friends {
+		if base64.StdEncoding.EncodeToString(k) == want {
+			a.friends = append(a.friends[:i], a.friends[i+1:]...)
+			a.syncFriendsLocked()
+			if a.opts.Info != nil {
+				a.opts.Info("friends         : %d allowed", len(a.friends))
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("friend not in list")
+}
+
+// syncFriendsLocked pushes the current allowlist to the tunnel. The tunnel
+// only exists after registration, so callers must hold a.mu.
+func (a *Agent) syncFriendsLocked() {
+	if a.tunnel != nil {
+		a.tunnel.SetFriends(a.friends)
+	}
 }
 
 // messageLoop consumes server messages and drives the tunnel, virtual NIC,
@@ -375,10 +460,14 @@ func (a *Agent) onRegistered(env protocol.Envelope) {
 		}
 		adVnic, err := vnic.Open(adapterName, reg.VirtualIP, "255.255.255.0")
 		if err != nil {
+			a.mu.Lock()
+			a.vnicErr = err.Error()
+			a.mu.Unlock()
 			a.opts.Logf("warning: virtual NIC unavailable: %v", err)
 		} else {
 			a.mu.Lock()
 			a.adVnic = adVnic
+			a.vnicErr = ""
 			a.mu.Unlock()
 			a.opts.Info("virtual NIC    : %s (%s)", adapterName, reg.VirtualIP)
 			go func() {

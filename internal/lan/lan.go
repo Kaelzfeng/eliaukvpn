@@ -226,8 +226,8 @@ func BuildDiscovery(src net.IP, payload []byte) []byte {
 	pkt := make([]byte, total)
 	pkt[0] = 0x45 // IPv4, IHL=5
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(total))
-	pkt[8] = 64  // TTL
-	pkt[9] = 17  // UDP
+	pkt[8] = 64 // TTL
+	pkt[9] = 17 // UDP
 	copy(pkt[12:16], s)
 	copy(pkt[16:20], group)
 	// UDP header: source and destination ports are both the discovery port; the

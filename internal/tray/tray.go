@@ -36,11 +36,20 @@ type Item struct {
 const (
 	wmApp = 0x8000
 
-	wmTray    = wmApp + 1 // Shell_NotifyIcon callback message
-	wmQuitAsk = wmApp + 2 // Stop() marshal: quit from the UI thread
+	// CallbackMsg is the Shell_NotifyIcon callback message (WM_APP+1). A host
+	// window (main window / message-only window) must forward it to
+	// Tray.HandleTrayMsg so right-clicks and double-clicks work.
+	CallbackMsg = wmApp + 1
+	wmTray      = wmApp + 1 // alias for the internal callback constant
+	wmQuitAsk   = wmApp + 2 // Stop() marshal: quit from the UI thread
 
 	wmDestroy   = 0x0002
 	wmRButtonUp = 0x0205
+	wmLDblClk   = 0x0203
+
+	// Mouse-message lParam values delivered with CallbackMsg to a host window.
+	RButtonUp = wmRButtonUp
+	LDblClk   = wmLDblClk
 
 	nimAdd    = 0x00000000
 	nimModify = 0x00000001
@@ -166,7 +175,8 @@ type Tray struct {
 	once   sync.Once
 }
 
-// New constructs an unstarted tray icon. Call Run to start it.
+// New constructs an unstarted tray icon that owns its own hidden message
+// window. Call Run to start it (it pumps the window's messages itself).
 func New() (*Tray, error) {
 	t := &Tray{
 		iconID: 1,
@@ -175,6 +185,44 @@ func New() (*Tray, error) {
 	}
 	t.cb = syscall.NewCallback(t.wndProc)
 	return t, nil
+}
+
+// NewOnWindow attaches a tray icon to an existing window owned by the caller.
+// The host window must forward tray.CallbackMsg to HandleTrayMsg and pump its
+// own messages; this Tray never starts a message loop or registers a class.
+// Menu selections still arrive on Select(); double-click is reported by the
+// host (see RButtonUp / LDblClk constants).
+func NewOnWindow(hwnd uintptr) *Tray {
+	return &Tray{
+		iconID: 1,
+		hwnd:   hwnd,
+		selCh:  make(chan int, 4),
+		doneCh: make(chan struct{}),
+	}
+}
+
+// Add publishes the tray icon (NIM_ADD). Call it after SetMenu/SetTooltip.
+func (t *Tray) Add() error {
+	if err := t.loadIcon(); err != nil {
+		return err
+	}
+	t.update(true)
+	return nil
+}
+
+// Delete removes the tray icon and frees resources. Safe from any goroutine.
+func (t *Tray) Delete() {
+	t.deleteIcon()
+	t.once.Do(func() { close(t.doneCh) })
+}
+
+// HandleTrayMsg dispatches a Shell_NotifyIcon callback message (CallbackMsg)
+// forwarded from the host window's wndProc; lParam is the mouse message.
+// Right-click shows the context menu. Must be called on the UI thread.
+func (t *Tray) HandleTrayMsg(l uintptr) {
+	if uint32(l) == wmRButtonUp {
+		t.showMenu()
+	}
 }
 
 // wndProc is the message-only window's procedure. All UI-thread work
@@ -358,7 +406,7 @@ func (t *Tray) buildMenu(items []Item) (uintptr, error) {
 
 // loadIcon writes the generated ICO to a temp file and loads it as a HICON.
 func (t *Tray) loadIcon() error {
-	ico := makeIconICO()
+	ico := IconICO()
 	f, err := os.CreateTemp("", "eliauk-*.ico")
 	if err != nil {
 		return err

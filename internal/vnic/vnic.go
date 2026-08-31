@@ -36,11 +36,11 @@ var ErrClosed = errors.New("vnic: adapter closed")
 
 // Adapter wraps a Wintun session.
 type Adapter struct {
-	name     string
-	a        *wintun.Adapter
-	sess     wintun.Session
-	closed   atomic.Bool
-	readers  atomic.Int32 // number of goroutines inside Read
+	name      string
+	a         *wintun.Adapter
+	sess      wintun.Session
+	closed    atomic.Bool
+	readers   atomic.Int32 // number of goroutines inside Read
 	closeOnce sync.Once
 }
 
