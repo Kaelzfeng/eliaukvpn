@@ -63,6 +63,20 @@
 - **加密**：Noise / WireGuard 模式，兼做好友白名单。
 - MC Java 走 TCP（25565），隧道把 IP 包/帧塞进 UDP 带走。
 
+## 运行指南（Quickstart）
+- **协调服务器**（公网 VPS 或本机测试）：
+  `go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网IP>:9091`
+  （注意：本机 8080/8081 被遗留进程占用，测试一律用 9090/9091。）
+- **交互式 CLI 客户端**（调试打洞用）：`bin/client.exe -name host -server ws://<server>:9090/ws [-vnic]`
+- **托盘 GUI**（正式使用）：`bin/gui.exe -name host -server ws://<server>:9090/ws`
+  （release 无控制台版：`go build -ldflags "-H windowsgui" ./cmd/gui`）
+- **首次使用**：启动即自动生成 `%AppData%\Eliauk\identity.key`（X25519），打印 base64 指纹。
+  **互加好友**：把对方的指纹写进 `--friends` 文件（每行一个，`#` 注释）——只有白名单内的指纹能建会话。
+- **M9 跨机验证步骤**（真机双端）：
+  1. 每台机器装同一 `gui.exe` 或 `client.exe` + 各自的 keyfile；
+  2. 互加好友白名单；3. 一台开 MC 局域网房（或 `mcprobe.exe -mode server`），另一台 `mcprobe.exe -mode client` 应看到 `discovered world ... at <hostVIP> (port 25565)` 且 `TCP connect OK`；
+  4. 验收点：发现包源是虚拟 IP（只能来自隧道）、TCP 握手 `--debug-packets` 双向实锤、真实 NAT 打洞成功（不用 `--force-relay`）。
+
 ## M6c 详情（Windows 托盘 GUI，已 e2e 验证）
 - **`internal/agent`（重构核心）**：把 `cmd/client` 的注册/STUN/隧道/网卡/广播/自动连接逻辑抽成可复用包；`Agent` 暴露 `Peers()/Snapshot()/Connect()/Status()/Run(ctx)`。CLI（交互式）和 GUI（托盘）共用同一内核 —— 之前双端代码是复制粘贴的，现在一份实现。
 - **`internal/tray`（纯 Win32，零新依赖）**：`syscall.NewLazyDLL` 直调 user32/shell32 —— `RegisterClassW`+`CreateWindowExW`（**消息窗口 parent = `HWND_MESSAGE` = (HWND)-3，不是 -1！** -1 是 `HWND_TOPMOST`，会报 `ERROR_INVALID_WINDOW_HANDLE` 1400）+ `GetMessageW` 泵 + `Shell_NotifyIconW`（NIM_ADD/MODIFY/DELETE）+ 右键 `TrackPopupMenu`（`TPM_RETURNCMD` 直接拿命令 id）。托盘图标是运行时画的 32x32 ICO（绿色圆盘 + 白色 E），写临时文件 `LoadImageW` 加载，无二进制资产。菜单模型 `Item`（Label/Separator/Disabled/Submenu/ID），每次右键按当前模型重建（`AppendMenuW` 复制字符串）。
