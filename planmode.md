@@ -37,6 +37,13 @@
 ### 3. 加密
 Noise / WireGuard 模式做密钥协商与数据加密，顺带做「好友白名单」（只有交换过密钥的机器能连）。
 
+### 4. 广播模拟（M5，已实现）
+Wintun 是 L3 无广播 → MC 局域网发现（UDP 224.0.2.60:4445）在软件层模拟：
+- **host 端**：`lan.Listen` 绑定 4445（SO_REUSEADDR）并在全部 up 网卡 JoinGroup（含 wintun）→ 嗅探本地广播 → `lan.BuildDiscovery` 把**裸 UDP 负载**（`lan.Listen` 回调无 IP 头）包成完整 IPv4/UDP 包、源改为自己的虚拟 IP → `SendDataBroadcast` 扇出给所有 peer。
+- **join 端**：dataSink 收到发现包 → 注入原组播 + 一份改写目的为自身 VIP 的副本（兼容未 JoinGroup 的 0.0.0.0:4445 客户端）。
+- **loop guard**：源在虚拟子网的包丢弃（防回声再转发）。
+- **每 peer /32 主机路由**（`route add <peerVIP> mask 255.255.255.255 0.0.0.0 IF <网卡>`，自动安装）：保证到 peer VIP 的流量进虚拟网卡、经隧道 —— 同机双向 TCP 握手都因此真实穿越隧道（debug 日志实锤）。
+
 ## 架构蓝图
 ```
 ┌─ 协调服务器（VPS，WebSocket）──────────────┐
@@ -58,8 +65,9 @@ Noise / WireGuard 模式做密钥协商与数据加密，顺带做「好友白�
 - [x] **M2** UDP 打洞直连（最小打通：两客户端经服务器交换候选后互发 UDP，本地双向验证通过）
 - [x] **M3** TURN 中继回退（打洞失败时流量走服务器）
 - [x] **M4** 虚拟网卡打通（绑定 Wintun，虚拟 IP 分配 + 自动连接 + 数据面送达）
-- [ ] **M5** 游戏链路（先手动输虚拟 IP 直连验证 → 再加软件层广播模拟，实现 MC 局域网发现）
+- [x] **M5** 游戏链路（MC 局域网发现端到端经隧道验证：4445 嗅探 → 源改写为 VIP → SendDataBroadcast → dataSink 双路注入；每 peer /32 路由强制走隧道；mcprobe 假 MC 端到端 + `--debug-packets` 双向实锤）
 - [ ] **M6** 加密（Noise）+ 好友白名单 + GUI 托盘（Windows 桌面）
+- [ ] **M9** 跨机验证（真实双机跑 mcprobe，覆盖真实 NAT 打洞；同机已验证通过）
 
 ## 技术栈（已确定 ✅）
 - **语言**：**Go**（goroutine 适合网络层、上手快、编译为单个 exe）

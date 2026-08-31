@@ -15,12 +15,14 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"eliaukvpn/internal/lan"
 	"eliaukvpn/internal/p2p"
 	"eliaukvpn/internal/protocol"
 	"eliaukvpn/internal/stun"
@@ -42,6 +44,9 @@ func run() error {
 		forceRelay    = flag.Bool("force-relay", false, "skip direct punching, always relay via server (testing / symmetric NAT)")
 		useVnic       = flag.Bool("vnic", true, "create and use the Wintun virtual NIC")
 		vnicName      = flag.String("vnic-name", "", "virtual NIC adapter name (default Eliauk-<name>)")
+		lanEmu        = flag.Bool("lan", true, "emulate Minecraft LAN discovery (UDP 4445 broadcast fan-out)")
+		headless      = flag.Bool("headless", false, "run as a background agent without the interactive command loop")
+		debugPackets  = flag.Bool("debug-packets", false, "log every packet flowing between the virtual NIC and the tunnel")
 	)
 	flag.Parse()
 	if *name == "" {
@@ -74,6 +79,7 @@ func run() error {
 	var (
 		mu        sync.Mutex
 		myID      string
+		myVIP     string // our assigned virtual IP (M5: discovery source rewrite)
 		tunnel    *p2p.Tunnel
 		adVnic    *vnic.Adapter
 		routes    = make(map[string]string) // virtual ip -> peer id (M4)
@@ -82,15 +88,39 @@ func run() error {
 		byName    = make(map[string]protocol.Peer)
 	)
 
+	// ensurePeerRoute installs a /32 host route so traffic to a peer's virtual
+	// IP is forced into our virtual NIC (M5). Requires an elevated process,
+	// which wintun adapter creation already demands. Duplicate additions (route
+	// already present on reconnect) are harmless.
+	ensurePeerRoute := func(peerVIP string) {
+		mu.Lock()
+		a := adVnic
+		mu.Unlock()
+		if a == nil || peerVIP == "" {
+			return
+		}
+		idx := a.IfIndex()
+		if idx == 0 {
+			return
+		}
+		out, err := exec.Command("route", "add", peerVIP, "mask", "255.255.255.255",
+			"0.0.0.0", "IF", fmt.Sprint(idx)).CombinedOutput()
+		if err != nil {
+			log.Printf("route add %s via if%d: %v %s", peerVIP, idx, err, strings.TrimSpace(string(out)))
+		}
+	}
+
 	// autoConnect updates the virtual-IP route table and sends a
 	// connect_request for every online peer we haven't already tried, so the
 	// virtual LAN is fully connected without manual `connect` commands.
 	autoConnect := func(peers []protocol.Peer) {
 		var fresh []protocol.Peer
+		var routeVIPs []string
 		mu.Lock()
 		for _, p := range peers {
 			if p.VirtualIP != "" {
 				routes[p.VirtualIP] = p.ID
+				routeVIPs = append(routeVIPs, p.VirtualIP)
 			}
 			// Only auto-connect to peers that have reported a punchable
 			// endpoint — otherwise the server rejects the connect_request and
@@ -101,6 +131,13 @@ func run() error {
 			}
 		}
 		mu.Unlock()
+		// Force traffic to each peer's virtual IP into our virtual NIC; without
+		// the /32 host route the OS would pick an arbitrary interface for the
+		// 10.0.0.0/24 destination (often the real NIC or another VPN adapter)
+		// and the packet never reaches the wintun read loop.
+		for _, vip := range routeVIPs {
+			ensurePeerRoute(vip)
+		}
 		for _, p := range fresh {
 			if err := send(conn, protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: p.ID}); err != nil {
 				log.Printf("warning: auto-connect %s: %v", p.Name, err)
@@ -108,11 +145,54 @@ func run() error {
 		}
 	}
 
+	// forwardDiscovery fans a LAN-discovery advertisement out to every connected
+	// peer, carrying OUR virtual IP as the source so a joining MC client dials
+	// the host's virtual address (M5). It is reached from two places:
+	//
+	//   - sniffed (true): the local discovery listener delivered the raw UDP
+	//     datagram — payload only, no IP header. It is wrapped in a fresh
+	//     IPv4/UDP packet addressed to the discovery group and sourced from our
+	//     virtual IP (lan.RewriteSource would no-op: it needs a full IP packet).
+	//   - sniffed (false): a full IP packet read off the virtual NIC that is a
+	//     discovery advertisement, e.g. a broadcast a local server routed into
+	//     the adapter. Its source is rewritten to our virtual IP.
+	//
+	// Loop guard: any packet already carrying a virtual-subnet source is either
+	// one we forwarded or a peer's echo — re-forwarding would loop, so it is
+	// dropped regardless of which path it came in on.
+	forwardDiscovery := func(sniffed bool, src net.IP, pkt []byte) {
+		mu.Lock()
+		t := tunnel
+		vip := myVIP
+		mu.Unlock()
+		if t == nil || vip == "" {
+			return
+		}
+		if lan.InVirtualSubnet(src) {
+			return
+		}
+		virtual := net.ParseIP(vip)
+		var out []byte
+		if sniffed {
+			out = lan.BuildDiscovery(virtual, pkt)
+		} else {
+			out = lan.RewriteSource(pkt, virtual)
+		}
+		if out == nil {
+			return
+		}
+		t.SendDataBroadcast(out)
+	}
+
 	// forwardFromVnic routes one IP packet read off the virtual NIC to the
-	// peer that owns its destination virtual IP. Unknown destinations and
-	// non-unicast (broadcast/multicast) are dropped here; M5 adds broadcast.
+	// peer that owns its destination virtual IP. LAN-discovery advertisements
+	// (broadcast/multicast to UDP 4445) are fanned out to every peer instead.
 	forwardFromVnic := func(pkt []byte) {
-		dst := ipv4Dst(pkt)
+		if lan.IsDiscovery(pkt) {
+			forwardDiscovery(false, net.ParseIP(lan.IPv4Src(pkt)), pkt)
+			return
+		}
+		dst := lan.IPv4Dst(pkt)
 		if dst == "" {
 			return
 		}
@@ -122,6 +202,9 @@ func run() error {
 		mu.Unlock()
 		if !ok || t == nil {
 			return
+		}
+		if *debugPackets {
+			log.Printf("vnic->tunnel: %d B %s -> %s to %s", len(pkt), lan.IPv4Src(pkt), dst, peerID)
 		}
 		if err := t.SendData(peerID, pkt); err != nil {
 			// Peer not connected yet — drop; upper-layer retries will flow
@@ -145,6 +228,7 @@ func run() error {
 				myID = reg.ClientID
 				fmt.Printf("registered      : id=%s virtual_ip=%s\n", reg.ClientID, reg.VirtualIP)
 				mu.Lock()
+				myVIP = reg.VirtualIP
 				tunnel = p2p.New(p2pConn, myID, log.Printf)
 				go tunnel.Run()
 				if reg.RelayAddr != "" {
@@ -158,11 +242,32 @@ func run() error {
 					tunnel.SetForceRelay(true)
 				}
 				// Decapsulated IP packets from peers go into the virtual NIC.
+				// A LAN-discovery advertisement is delivered two ways (M5):
+				//   - as the original multicast, reaching a joining client that
+				//     joined the group on the Wintun interface;
+				//   - as a unicast copy to our own virtual IP, reaching a client
+				//     bound on 0.0.0.0:4445 even if it never joined the group on
+				//     Wintun (which reports no multicast flag).
+				// A local socket write to the group (LocalEmit) does NOT loop
+				// back on Windows, so it is not used.
 				tunnel.SetDataSink(func(pkt []byte) {
 					mu.Lock()
 					a := adVnic
+					vip := myVIP
 					mu.Unlock()
 					if a == nil {
+						return
+					}
+					if *debugPackets {
+						log.Printf("tunnel->vnic: %d B %s -> %s", len(pkt), lan.IPv4Src(pkt), lan.IPv4Dst(pkt))
+					}
+					if lan.IsDiscovery(pkt) && vip != "" {
+						if err := a.Write(pkt); err != nil {
+							log.Printf("vnic: write discovery: %v", err)
+						}
+						if err := a.Write(lan.RewriteDest(pkt, net.ParseIP(vip))); err != nil {
+							log.Printf("vnic: write discovery unicast: %v", err)
+						}
 						return
 					}
 					if err := a.Write(pkt); err != nil {
@@ -171,6 +276,24 @@ func run() error {
 				})
 				mergePeers(byID, byName, reg.Peers)
 				mu.Unlock()
+
+				if *lanEmu {
+					// Listen binds UDP 4445 with SO_REUSEADDR and joins the
+					// discovery group on every up interface (including the
+					// Wintun adapter). On the hosting machine this sniffs the
+					// MC server's broadcast so it can be re-broadcast through
+					// the tunnel; on a joining machine the adapter injection
+					// path doubles back here and the virtual-subnet loop guard
+					// drops it.
+					_, err := lan.Listen(func(pkt []byte, src net.IP) {
+						forwardDiscovery(true, src, pkt)
+					})
+					if err != nil {
+						log.Printf("warning: LAN discovery listener unavailable: %v", err)
+					} else {
+						fmt.Printf("lan discovery  : listening UDP %d/%s\n", lan.DiscoveryPort, lan.DiscoveryGroup)
+					}
+				}
 
 				if *useVnic {
 					adapterName := *vnicName
@@ -226,7 +349,17 @@ func run() error {
 		}
 	}()
 
-	// 4. Interactive command loop.
+	// 4. Run the agent. Interactive mode reads commands from stdin; headless
+	// mode just keeps the tunnel running until the server connection fails
+	// (used for background/automation deployment).
+	if *headless {
+		for {
+			if err := <-wsErr; err != nil {
+				return err
+			}
+		}
+	}
+
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println("commands: peers | connect <name|id> | status | quit")
 	for {
@@ -407,19 +540,6 @@ func printPeers(peers []protocol.Peer) {
 	for _, p := range peers {
 		fmt.Printf("  - %-12s %-12s %s (%s)\n", p.Name, p.VirtualIP, endpointString(p), p.NATType)
 	}
-}
-
-// ipv4Dst returns the destination address of an IPv4 packet, or "" if the
-// packet is not a well-formed IPv4 datagram.
-func ipv4Dst(pkt []byte) string {
-	if len(pkt) < 20 || pkt[0]>>4 != 4 {
-		return ""
-	}
-	ihl := int(pkt[0]&0x0f) * 4
-	if ihl < 20 || ihl > len(pkt) {
-		return ""
-	}
-	return net.IP(pkt[ihl-4 : ihl]).String()
 }
 
 func endpointString(p protocol.Peer) string {

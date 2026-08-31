@@ -172,6 +172,21 @@ func (t *Tunnel) SendData(peerID string, payload []byte) error {
 	return nil
 }
 
+// SendDataBroadcast sends an IP packet to every connected peer (M5). This is
+// how software-layer broadcast emulation fans a LAN-discovery packet out — the
+// virtual NIC has no broadcast/multicast of its own, so the client replicates
+// it to all peers, and each peer's dataSink writes it into its own NIC.
+func (t *Tunnel) SendDataBroadcast(payload []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, p := range t.peers {
+		if p.State != StateConnected {
+			continue
+		}
+		t.sendLocked(frameData, p, payload)
+	}
+}
+
 // HasPeer reports whether the tunnel knows about the given peer id.
 func (t *Tunnel) HasPeer(peerID string) bool {
 	t.mu.Lock()
