@@ -196,3 +196,54 @@ func TestMixedIdentityRejected(t *testing.T) {
 		t.Fatal("alice established a session with a legacy peer")
 	}
 }
+
+// TestWhitelistRejectsUnknownPeer verifies M6b: when a friends allowlist is
+// installed, a peer whose static key is not in it can never establish a session
+// or become connected.
+func TestWhitelistRejectsUnknownPeer(t *testing.T) {
+	alice, aConn := newTunnel(t, "aaaaaaaaaaaaaaaa")
+	bob, bConn := newTunnel(t, "bbbbbbbbbbbbbbbb")
+	aliceID, _ := crypto.GenerateIdentity()
+	bobID, _ := crypto.GenerateIdentity()
+	otherID, _ := crypto.GenerateIdentity()
+	alice.SetIdentity(aliceID)
+	alice.SetFriends([][]byte{otherID.PublicKey()}) // bob is NOT whitelisted
+	bob.SetIdentity(bobID)
+
+	alice.BeginConnect("bbbbbbbbbbbbbbbb", "bob", []*net.UDPAddr{bConn.LocalAddr().(*net.UDPAddr)})
+	bob.BeginConnect("aaaaaaaaaaaaaaaa", "alice", []*net.UDPAddr{aConn.LocalAddr().(*net.UDPAddr)})
+
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, s := range alice.Snapshot() {
+			if s.ID == "bbbbbbbbbbbbbbbb" && s.State == StateConnected {
+				t.Fatal("alice connected to a non-whitelisted peer")
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if alice.sessionFor(t, "bbbbbbbbbbbbbbbb") != nil {
+		t.Fatal("alice established a session with a non-whitelisted peer")
+	}
+}
+
+// TestWhitelistAcceptsFriend verifies that two peers who whitelist each other
+// connect and establish a session normally.
+func TestWhitelistAcceptsFriend(t *testing.T) {
+	alice, aConn := newTunnel(t, "aaaaaaaaaaaaaaaa")
+	bob, bConn := newTunnel(t, "bbbbbbbbbbbbbbbb")
+	aliceID, _ := crypto.GenerateIdentity()
+	bobID, _ := crypto.GenerateIdentity()
+	alice.SetIdentity(aliceID)
+	alice.SetFriends([][]byte{bobID.PublicKey()})
+	bob.SetIdentity(bobID)
+	bob.SetFriends([][]byte{aliceID.PublicKey()})
+
+	connectEncryptedPair(t, alice, bob, aConn, bConn)
+	if alice.sessionFor(t, "bbbbbbbbbbbbbbbb") == nil {
+		t.Fatal("alice has no session with a whitelisted friend")
+	}
+	if bob.sessionFor(t, "aaaaaaaaaaaaaaaa") == nil {
+		t.Fatal("bob has no session with a whitelisted friend")
+	}
+}

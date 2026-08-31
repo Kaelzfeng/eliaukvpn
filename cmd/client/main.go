@@ -50,6 +50,7 @@ func run() error {
 		headless      = flag.Bool("headless", false, "run as a background agent without the interactive command loop")
 		debugPackets  = flag.Bool("debug-packets", false, "log every packet flowing between the virtual NIC and the tunnel")
 		keyfile       = flag.String("keyfile", defaultKeyfile(), "path to the X25519 identity key (created on first run)")
+		friendsFile   = flag.String("friends", "", "path to the friends allowlist (base64 fingerprints, one per line; # comments)")
 	)
 	flag.Parse()
 	if *name == "" {
@@ -64,6 +65,36 @@ func run() error {
 		return fmt.Errorf("load identity %q: %w", *keyfile, err)
 	}
 	fmt.Printf("identity        : %s\n", identity.Fingerprint())
+
+	// 0b. Load the friends allowlist (M6b): only peers whose static keys are
+	//     listed here may establish a session. Each line is one base64
+	//     fingerprint copied from a friend's "identity:" line.
+	var friends [][]byte
+	if *friendsFile != "" {
+		f, err := os.Open(*friendsFile)
+		if err != nil {
+			return fmt.Errorf("open friends list: %w", err)
+		}
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			raw, err := crypto.ParseFingerprint(line)
+			if err != nil {
+				f.Close()
+				return fmt.Errorf("friends list %q line %q: %w", *friendsFile, line, err)
+			}
+			friends = append(friends, raw)
+		}
+		if err := sc.Err(); err != nil {
+			f.Close()
+			return fmt.Errorf("read friends list: %w", err)
+		}
+		f.Close()
+		fmt.Printf("friends         : %d allowed\n", len(friends))
+	}
 
 	// 1. Open the P2P socket FIRST — hole punching must use the same socket
 	//    whose public mapping we advertise, so the STUN probe runs on it.
@@ -243,6 +274,7 @@ func run() error {
 				myVIP = reg.VirtualIP
 				tunnel = p2p.New(p2pConn, myID, log.Printf)
 				tunnel.SetIdentity(identity)
+				tunnel.SetFriends(friends)
 				go tunnel.Run()
 				if reg.RelayAddr != "" {
 					if err := tunnel.SetRelay(reg.RelayAddr); err != nil {

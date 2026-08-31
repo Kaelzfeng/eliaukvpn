@@ -6,6 +6,7 @@ package p2p
 import (
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -93,6 +94,7 @@ type Tunnel struct {
 	dataSink   func(pkt []byte) // receives IP packets decapsulated from peers (M4)
 	logf       func(format string, args ...any)
 	identity   *crypto.Identity // M6: long-term X25519 identity; nil = legacy cleartext
+	friends    map[string]bool  // M6b: allowed peer static keys (base64 fingerprints); empty = allow all
 }
 
 // New creates a tunnel on conn. myID is this client's hex id.
@@ -128,6 +130,22 @@ func (t *Tunnel) Run() {
 func (t *Tunnel) SetIdentity(id *crypto.Identity) {
 	t.mu.Lock()
 	t.identity = id
+	t.mu.Unlock()
+}
+
+// SetFriends restricts which peers may establish a session to those whose
+// static X25519 public keys are in the allowlist (M6b). Pass the raw 32-byte
+// public keys; the tunnel matches on their base64 fingerprints. An empty list
+// (or never calling SetFriends) allows any peer that completes the handshake.
+func (t *Tunnel) SetFriends(pubkeys [][]byte) {
+	t.mu.Lock()
+	t.friends = make(map[string]bool, len(pubkeys))
+	for _, k := range pubkeys {
+		if len(k) != 32 {
+			continue
+		}
+		t.friends[base64.StdEncoding.EncodeToString(k)] = true
+	}
 	t.mu.Unlock()
 }
 
@@ -402,6 +420,14 @@ func (t *Tunnel) handleFrame(f *frame, addr *net.UDPAddr) {
 		rtt := time.Since(p.lastPing)
 		t.logf("p2p: tunnel to %s RTT=%s", p.Name, rtt.Round(time.Microsecond))
 	case frameData:
+		// In encryption mode a data frame from a peer with no negotiated session
+		// is ciphertext we cannot decrypt — either the handshake never completed
+		// or the peer was rejected (e.g. not in the friends list). Forwarding it
+		// would inject garbage into the virtual NIC, so drop it.
+		if t.identity != nil && p.session == nil {
+			t.logf("p2p: drop data from %s (no session)", p.Name)
+			return
+		}
 		pkt := f.payload
 		if p.session != nil {
 			var err error
@@ -473,11 +499,20 @@ func (t *Tunnel) initiatorHandshake(p *Peer, payload []byte) error {
 	return nil
 }
 
-// checkPeerStatic validates a peer's static identity key. Whitelist enforcement
-// (M6b) is added here.
+// checkPeerStatic validates a peer's static identity key and, when a friends
+// allowlist is installed (M6b), requires the key to be in it. A peer whose key
+// is not whitelisted cannot complete the handshake, so no session or encrypted
+// data ever flows to it. The fingerprint in the error is logged by the caller,
+// letting the user see who tried to connect and add them if they are a friend.
 func (t *Tunnel) checkPeerStatic(stat []byte) error {
 	if _, err := ecdh.X25519().NewPublicKey(stat); err != nil {
 		return fmt.Errorf("peer static key invalid: %w", err)
+	}
+	if len(t.friends) > 0 {
+		fp := base64.StdEncoding.EncodeToString(stat)
+		if !t.friends[fp] {
+			return fmt.Errorf("peer is not in the friends list (fingerprint %s)", fp)
+		}
 	}
 	return nil
 }
