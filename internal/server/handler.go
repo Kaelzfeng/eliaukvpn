@@ -17,8 +17,9 @@ var upgrader = websocket.Upgrader{
 
 // HandleWS upgrades one client connection, drives the register handshake and
 // then relays control messages for the lifetime of the connection. Game
-// traffic does NOT flow through this server — that goes peer-to-peer (M2+).
-func HandleWS(reg *Registry, w http.ResponseWriter, r *http.Request) {
+// traffic does NOT flow through this server — that goes peer-to-peer (M2+),
+// or through the UDP relay (M3) when NAT punching fails.
+func HandleWS(reg *Registry, relayAddr string, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("upgrade failed: %v", err)
@@ -60,6 +61,7 @@ func HandleWS(reg *Registry, w http.ResponseWriter, r *http.Request) {
 	_ = sendClient(client, protocol.TypeRegistered, protocol.Registered{
 		ClientID:  client.ID,
 		VirtualIP: client.VirtualIP,
+		RelayAddr: relayAddr,
 		Peers:     reg.Peers(client.ID),
 	})
 	broadcastPeers(reg)

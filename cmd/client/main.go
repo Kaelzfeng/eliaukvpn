@@ -38,6 +38,7 @@ func run() error {
 		serverAddr    = flag.String("server", "ws://127.0.0.1:8080/ws", "coordination server WebSocket URL")
 		stunPrimary   = flag.String("stun-primary", "stun.l.google.com:19302", "primary STUN server")
 		stunSecondary = flag.String("stun-secondary", "stun.cloudflare.com:3478", "secondary STUN server (symmetry detection)")
+		forceRelay    = flag.Bool("force-relay", false, "skip direct punching, always relay via server (testing / symmetric NAT)")
 	)
 	flag.Parse()
 	if *name == "" {
@@ -93,6 +94,16 @@ func run() error {
 				mu.Lock()
 				tunnel = p2p.New(p2pConn, myID, log.Printf)
 				go tunnel.Run()
+				if reg.RelayAddr != "" {
+					if err := tunnel.SetRelay(reg.RelayAddr); err != nil {
+						log.Printf("warning: bad relay addr %q: %v", reg.RelayAddr, err)
+					} else {
+						tunnel.Announce()
+					}
+				}
+				if *forceRelay {
+					tunnel.SetForceRelay(true)
+				}
 				mergePeers(byID, byName, reg.Peers)
 				mu.Unlock()
 				printPeers(reg.Peers)

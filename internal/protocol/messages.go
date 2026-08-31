@@ -31,6 +31,7 @@ type RegisterRequest struct {
 type Registered struct {
 	ClientID  string `json:"client_id"`
 	VirtualIP string `json:"virtual_ip"`
+	RelayAddr string `json:"relay_addr"` // server's UDP relay endpoint (M3)
 	Peers     []Peer `json:"peers"`
 }
 

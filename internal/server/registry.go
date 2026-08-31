@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -33,17 +34,34 @@ type Client struct {
 
 // Registry keeps track of connected clients and hands out virtual IPs.
 type Registry struct {
-	mu      sync.Mutex
-	clients map[string]*Client
-	nextIP  int
+	mu        sync.Mutex
+	clients   map[string]*Client
+	nextIP    int
+	relayAddr map[string]*net.UDPAddr // client id -> address it relays from
 }
 
 // NewRegistry creates an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		clients: make(map[string]*Client),
-		nextIP:  firstClientIP,
+		clients:   make(map[string]*Client),
+		nextIP:    firstClientIP,
+		relayAddr: make(map[string]*net.UDPAddr),
 	}
+}
+
+// SetRelayAddr records the UDP address a client sends relay traffic from.
+func (r *Registry) SetRelayAddr(id string, addr *net.UDPAddr) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.relayAddr[id] = addr
+}
+
+// RelayAddr returns the relay address learned for a client id.
+func (r *Registry) RelayAddr(id string) (*net.UDPAddr, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.relayAddr[id]
+	return a, ok
 }
 
 // Add registers a new client and assigns it a virtual IP.

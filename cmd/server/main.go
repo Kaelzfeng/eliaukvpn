@@ -16,12 +16,24 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address, e.g. :8080")
+	// relayPublic is advertised to clients so they know where to send relay
+	// traffic. For local testing 127.0.0.1 works; on a real VPS set it to the
+	// server's public IP.
+	relayPublic := flag.String("relay-public", "127.0.0.1:8081", "relay endpoint advertised to clients")
+	relayListen := flag.String("relay-listen", "0.0.0.0:8081", "relay listen address")
 	flag.Parse()
 
 	reg := server.NewRegistry()
 
+	relay, err := server.NewRelay(reg, *relayListen)
+	if err != nil {
+		log.Fatalf("start relay: %v", err)
+	}
+	defer relay.Close()
+	log.Printf("udp relay listening on %s (advertised as %s)", relay.Addr(), *relayPublic)
+
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		server.HandleWS(reg, w, r)
+		server.HandleWS(reg, *relayPublic, w, r)
 	})
 
 	// Debug endpoint: dump the registry as JSON.
