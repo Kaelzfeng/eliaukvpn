@@ -58,6 +58,23 @@ func TestLoadCorruptIsError(t *testing.T) {
 	}
 }
 
+func TestLoadStripsUTF8BOM(t *testing.T) {
+	// PowerShell's Set-Content -Encoding UTF8 (and Notepad) prepend a BOM;
+	// encoding/json rejects it, so Load must strip it first.
+	path := filepath.Join(t.TempDir(), "bom.json")
+	raw := append([]byte("\xef\xbb\xbf"), []byte(`{"name":"bom-host"}`)...)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("BOM'd config should load: %v", err)
+	}
+	if c.Name != "bom-host" {
+		t.Fatalf("Name = %q, want %q", c.Name, "bom-host")
+	}
+}
+
 func TestAddRemoveFriend(t *testing.T) {
 	c := &Config{}
 	if !c.AddFriend("Bob", "  AAAA==  ") {

@@ -26,7 +26,7 @@ import (
 const (
 	// Client-area size in pixels (fixed, non-resizable).
 	winW = 520
-	winH = 700
+	winH = 786
 	// WS_OVERLAPPEDWINDOW (0x00CF0000) minus WS_THICKFRAME/WS_MAXIMIZEBOX.
 	winStyle = 0x00CA0000
 )
@@ -111,6 +111,16 @@ const (
 	idcRoomJoin   = 121
 	idcRoomLeave  = 122
 	idcRoomState  = 123 // "房间：ABC · 2 人" / "未加入房间"
+	// M7c game panel controls.
+	idcJavaEdit   = 124 // java.exe path
+	idcJarEdit    = 125 // server.jar path
+	idcGameDetect = 126 // 自动检测
+	idcSrvCopy    = 127 // 复制地址 (copy the joinable address)
+	idcGameStart  = 128 // 启动服务器
+	idcGameStop   = 129 // 停止服务器
+	idcMCAdd      = 130 // 添加到启动器 (servers.dat)
+	idcLaunch     = 131 // 启动游戏 (official launcher)
+	idcGameState  = 132 // game status line
 )
 
 // EvType is a user action emitted by the window.
@@ -138,6 +148,17 @@ const (
 	EvRoomCreate
 	EvRoomJoin
 	EvRoomLeave
+	// M7c game panel actions.
+	// EvGameDetect: user clicked 自动检测 — re-run Java/jar detection.
+	// EvSrvStart: user clicked 启动服务器 — Text is the java path, Text2 the jar.
+	// EvSrvStop / EvSrvCopy (copy the joinable address) / EvMCAdd (register the
+	// server in the launcher's multiplayer list) / EvLaunch (start the launcher).
+	EvGameDetect
+	EvSrvStart
+	EvSrvStop
+	EvSrvCopy
+	EvMCAdd
+	EvLaunch
 )
 
 // EvMsg is one user action with its payload.
@@ -166,6 +187,12 @@ type View struct {
 
 	Name   string // settings: display name
 	Server string // settings: server address
+
+	// M7c game panel: remembered/auto-detected paths and the running state.
+	Java        string // java.exe path (prefilled, editable)
+	Jar         string // server.jar path (prefilled, editable)
+	GameState   string // "服务器：运行中 · 可加入 10.8.0.1:25565" / "未运行" ...
+	GameRunning bool   // start vs stop button shows depending on this
 }
 
 // MsgHook lets the host intercept messages before the window's own handling.
@@ -187,6 +214,9 @@ type Window struct {
 	acctEdit, passEdit, loginBtn, registerBtn, logoutBtn, acctStateTxt         uintptr
 	addHintTxt, roomCreateBtn, roomCodeEdit, roomJoinBtn, roomLeaveBtn         uintptr
 	roomStateTxt                                                               uintptr
+	// M7c game panel controls.
+	javaEdit, jarEdit, gameDetectBtn, srvCopyBtn                               uintptr
+	gameStartBtn, gameStopBtn, mcAddBtn, launchBtn, gameStateTxt               uintptr
 
 	mu         sync.Mutex
 	pending    View
@@ -398,6 +428,18 @@ func (w *Window) onCommand(wParam uintptr) uintptr {
 		setText(w.roomCodeEdit, "")
 	case idcRoomLeave:
 		w.emit(EvMsg{Type: EvRoomLeave})
+	case idcGameDetect:
+		w.emit(EvMsg{Type: EvGameDetect})
+	case idcGameStart:
+		w.emit(EvMsg{Type: EvSrvStart, Text: w.getText(w.javaEdit), Text2: w.getText(w.jarEdit)})
+	case idcGameStop:
+		w.emit(EvMsg{Type: EvSrvStop})
+	case idcSrvCopy:
+		w.emit(EvMsg{Type: EvSrvCopy})
+	case idcMCAdd:
+		w.emit(EvMsg{Type: EvMCAdd})
+	case idcLaunch:
+		w.emit(EvMsg{Type: EvLaunch})
 	}
 	return 0
 }
@@ -434,6 +476,13 @@ func (w *Window) applyView(v View) {
 	setVisible(w.roomCodeEdit, !v.RoomIn)
 	setVisible(w.roomJoinBtn, !v.RoomIn)
 	setVisible(w.roomLeaveBtn, v.RoomIn)
+
+	// M7c game panel: prefilled paths and the running state.
+	setText(w.javaEdit, v.Java)
+	setText(w.jarEdit, v.Jar)
+	setText(w.gameStateTxt, v.GameState)
+	setVisible(w.gameStartBtn, !v.GameRunning)
+	setVisible(w.gameStopBtn, v.GameRunning)
 
 	procSendMessageW.Call(w.listBox, lbResetContent, 0, 0)
 	for _, row := range v.Rows {
@@ -519,18 +568,31 @@ func (w *Window) createControls() {
 	w.roomLeaveBtn = w.create("BUTTON", "离开房间", bsPushButton|wsTabStop, 282, 244, 92, 26, idcRoomLeave)
 	w.roomStateTxt = w.create("STATIC", "未加入房间", 0, 16, 278, 488, 18, idcRoomState)
 
-	w.create("BUTTON", "连接状态", bsGroupBox, 8, 308, 504, 252, 0)
-	w.listBox = w.create("LISTBOX", "", wsBorder|wsVScroll|lbsNotify, 16, 326, 488, 200, idcList)
-	w.deleteBtn = w.create("BUTTON", "删除选中好友", bsPushButton|wsTabStop, 16, 532, 120, 26, idcDelete)
+	w.create("BUTTON", "游戏", bsGroupBox, 8, 308, 504, 118, 0)
+	w.create("STATIC", "Java 路径", 0, 16, 328, 64, 20, 0)
+	w.javaEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 82, 326, 300, 22, idcJavaEdit)
+	w.gameDetectBtn = w.create("BUTTON", "自动检测", bsPushButton|wsTabStop, 388, 324, 112, 26, idcGameDetect)
+	w.create("STATIC", "服务器 jar", 0, 16, 356, 64, 20, 0)
+	w.jarEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 82, 354, 300, 22, idcJarEdit)
+	w.srvCopyBtn = w.create("BUTTON", "复制地址", bsPushButton|wsTabStop, 388, 352, 112, 26, idcSrvCopy)
+	w.gameStartBtn = w.create("BUTTON", "启动服务器", bsPushButton|wsTabStop, 16, 386, 112, 26, idcGameStart)
+	w.gameStopBtn = w.create("BUTTON", "停止服务器", bsPushButton|wsTabStop, 136, 386, 112, 26, idcGameStop)
+	w.mcAddBtn = w.create("BUTTON", "添加服务器", bsPushButton|wsTabStop, 256, 386, 112, 26, idcMCAdd)
+	w.launchBtn = w.create("BUTTON", "启动游戏", bsPushButton|wsTabStop, 376, 386, 112, 26, idcLaunch)
+	w.gameStateTxt = w.create("STATIC", "未运行", 0, 16, 418, 488, 18, idcGameState)
 
-	w.create("BUTTON", "设置", bsGroupBox, 8, 564, 504, 128, 0)
-	w.create("STATIC", "昵称", 0, 16, 584, 40, 20, 0)
-	w.nameEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 58, 582, 150, 22, idcName)
-	w.create("STATIC", "服务器", 0, 218, 584, 50, 20, 0)
-	w.serverEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 270, 582, 232, 22, idcServer)
-	w.create("STATIC", "首次使用：填写昵称与服务器地址后点保存。服务器地址形如 ws://主机:9090/ws", 0, 16, 612, 488, 18, 0)
-	w.saveBtn = w.create("BUTTON", "保存并连接", bsPushButton|wsTabStop, 16, 640, 120, 28, idcSave)
-	w.quitBtn = w.create("BUTTON", "退出", bsPushButton|wsTabStop, 392, 640, 80, 28, idcQuit)
+	w.create("BUTTON", "连接状态", bsGroupBox, 8, 430, 504, 210, 0)
+	w.listBox = w.create("LISTBOX", "", wsBorder|wsVScroll|lbsNotify, 16, 448, 488, 160, idcList)
+	w.deleteBtn = w.create("BUTTON", "删除选中好友", bsPushButton|wsTabStop, 16, 614, 120, 26, idcDelete)
+
+	w.create("BUTTON", "设置", bsGroupBox, 8, 644, 504, 118, 0)
+	w.create("STATIC", "昵称", 0, 16, 664, 40, 20, 0)
+	w.nameEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 58, 662, 150, 22, idcName)
+	w.create("STATIC", "服务器", 0, 218, 664, 50, 20, 0)
+	w.serverEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 270, 662, 232, 22, idcServer)
+	w.create("STATIC", "首次使用：填写昵称与服务器地址后点保存。服务器地址形如 ws://主机:9090/ws", 0, 16, 692, 488, 18, 0)
+	w.saveBtn = w.create("BUTTON", "保存并连接", bsPushButton|wsTabStop, 16, 720, 120, 28, idcSave)
+	w.quitBtn = w.create("BUTTON", "退出", bsPushButton|wsTabStop, 392, 720, 80, 28, idcQuit)
 }
 
 // loadFonts picks the stock GUI font for all controls and a bold face for the
@@ -556,6 +618,8 @@ func (w *Window) applyFonts() {
 		w.acctEdit, w.passEdit, w.loginBtn, w.registerBtn, w.logoutBtn,
 		w.acctStateTxt, w.addHintTxt, w.roomCreateBtn, w.roomCodeEdit,
 		w.roomJoinBtn, w.roomLeaveBtn, w.roomStateTxt,
+		w.javaEdit, w.jarEdit, w.gameDetectBtn, w.srvCopyBtn,
+		w.gameStartBtn, w.gameStopBtn, w.mcAddBtn, w.launchBtn, w.gameStateTxt,
 	} {
 		procSendMessageW.Call(h, wmSetFont, w.font, 1)
 	}

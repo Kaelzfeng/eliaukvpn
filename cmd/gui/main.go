@@ -27,6 +27,7 @@ import (
 	"eliaukvpn/internal/agent"
 	"eliaukvpn/internal/config"
 	"eliaukvpn/internal/crypto"
+	"eliaukvpn/internal/mc"
 	"eliaukvpn/internal/p2p"
 	"eliaukvpn/internal/protocol"
 	"eliaukvpn/internal/tray"
@@ -63,6 +64,7 @@ func run() error {
 		accountFlag   = flag.String("account", "", "M7 account to log in as (automation hook; needs -password)")
 		passwordFlag  = flag.String("password", "", "password for -account")
 		createFlag    = flag.Bool("create-account", false, "register -account instead of logging in")
+		gameStartJar  = flag.String("game-start", "", "automation hook: start the dedicated server with this jar after registering (e2e)")
 	)
 	flag.Parse()
 
@@ -113,6 +115,18 @@ func run() error {
 			keyfile:       *keyfile,
 		},
 	}
+
+	// M7c game panel: prefill the Java / server.jar paths from the config,
+	// falling back to auto-detection on a fresh install.
+	a.mcJava = cfg.Java
+	if a.mcJava == "" {
+		a.mcJava = mc.FindJava()
+	}
+	a.mcJar = cfg.ServerJar
+	if a.mcJar == "" {
+		a.mcJar = mc.FindServerJar()
+	}
+	log.Printf("game: java=%q server-jar=%q", a.mcJava, a.mcJar)
 
 	// Automation hook: log in / register an account on startup (used by the e2e
 	// script). The plaintext password lives only in a.pendingPass and is never
@@ -188,6 +202,9 @@ func run() error {
 		}
 	}()
 
+	if *gameStartJar != "" {
+		go a.autoStartGame(*gameStartJar)
+	}
 	go a.agentLoop()
 	go a.tickLoop()
 
@@ -258,17 +275,31 @@ type app struct {
 	pendingPass   string
 	pendingCreate bool
 
+	// M7c game panel: remembered Java / server.jar paths, the running dedicated
+	// server process, and a short tail of its output (all under mu).
+	mcJava  string
+	mcJar   string
+	mcSrv   *mc.Server
+	mcTail  []string
+
 	quitOnce sync.Once
 }
 
-// quit stops the agent and asks the window/tray to shut down. Idempotent.
+// quit stops the agent and the dedicated Minecraft server (if any) and asks the
+// window/tray to shut down. Idempotent.
 func (a *app) quit() {
 	a.quitOnce.Do(func() {
 		a.mu.Lock()
 		if a.cancel != nil {
 			a.cancel()
 		}
+		srv := a.mcSrv
+		a.mcSrv = nil
 		a.mu.Unlock()
+		if srv != nil {
+			srv.Stop()
+			log.Printf("game: server stopped at exit")
+		}
 		close(a.quitCh)
 	})
 }
@@ -529,6 +560,26 @@ func (a *app) view() window.View {
 		}
 	}
 
+	// M7c game panel: prefilled paths plus the running/joinable state. When a
+	// dedicated server runs locally its address is our own virtual IP:25565;
+	// otherwise the room host's address is the one to join.
+	a.mu.Lock()
+	v.Java, v.Jar = a.mcJava, a.mcJar
+	gameRunning := a.mcSrv != nil && a.mcSrv.Running()
+	a.mu.Unlock()
+	v.GameRunning = gameRunning
+	if addr := a.joinableAddr(); addr != "" {
+		if gameRunning {
+			v.GameState = "服务器运行中 · 可加入 " + addr
+		} else {
+			v.GameState = "未运行 · 可加入 " + addr
+		}
+	} else if gameRunning {
+		v.GameState = "服务器运行中"
+	} else {
+		v.GameState = "未运行"
+	}
+
 	online, conn := peerState(ag)
 	if acct != "" {
 		for _, f := range ag.FriendDirectory() {
@@ -648,6 +699,18 @@ func (a *app) handleEvent(ev window.EvMsg) {
 		a.roomAction(func(ag *agent.Agent) error { return ag.JoinRoom(ev.Text) }, "已加入房间", true)
 	case window.EvRoomLeave:
 		a.roomAction(func(ag *agent.Agent) error { return ag.LeaveRoom() }, "已离开房间", true)
+	case window.EvGameDetect:
+		a.detectGame()
+	case window.EvSrvStart:
+		a.startGame(ev.Text, ev.Text2)
+	case window.EvSrvStop:
+		a.stopGame()
+	case window.EvSrvCopy:
+		a.copyGameAddr()
+	case window.EvMCAdd:
+		a.addToLauncher()
+	case window.EvLaunch:
+		a.launchGame()
 	}
 }
 
@@ -797,6 +860,192 @@ func (a *app) roomAction(fn func(*agent.Agent) error, okNote string, good bool) 
 		return
 	}
 	a.setNote(okNote, good)
+}
+
+// ---- M7c game panel ----
+
+// joinableAddr is the Minecraft server address to copy/show: our own virtual
+// IP when a dedicated server is running locally, otherwise the room host's
+// virtual IP (the one running the game server guests should join).
+func (a *app) joinableAddr() string {
+	a.mu.Lock()
+	ag := a.ag
+	srv := a.mcSrv
+	a.mu.Unlock()
+	if ag == nil {
+		return ""
+	}
+	if srv != nil && srv.Running() {
+		if vip := ag.Status().VirtualIP; vip != "" {
+			return vip + ":25565"
+		}
+	}
+	if room := ag.RoomState(); room != nil {
+		for _, m := range room.Members {
+			if m.Host && m.VirtualIP != "" {
+				return m.VirtualIP + ":25565"
+			}
+		}
+	}
+	return ""
+}
+
+// gameLogf returns the log callback the dedicated server feeds; it keeps a
+// bounded tail of the server's output under the app lock.
+func (a *app) gameLogf() func(string) {
+	return func(line string) {
+		a.mu.Lock()
+		a.mcTail = append(a.mcTail, line)
+		if len(a.mcTail) > 20 {
+			a.mcTail = a.mcTail[len(a.mcTail)-20:]
+		}
+		a.mu.Unlock()
+	}
+}
+
+// autoStartGame is the -game-start automation hook: once the agent is
+// registered, start the dedicated server with the given jar and the auto-
+// detected (or configured) Java. Bound so a failed login can't hang the e2e.
+func (a *app) autoStartGame(jar string) {
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		ag := a.ag
+		a.mu.Unlock()
+		if ag != nil && ag.Status().Registered {
+			a.startGame("", jar)
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	log.Printf("game: auto-start aborted: agent not registered within 40s")
+}
+
+// persistGamePaths remembers the last-used Java / server.jar so the next start
+// prefills them.
+func (a *app) persistGamePaths(java, jar string) {
+	a.mu.Lock()
+	a.mcJava, a.mcJar = java, jar
+	a.cfg.Java, a.cfg.ServerJar = java, jar
+	a.mu.Unlock()
+	if err := a.cfg.Save(a.cfgPath); err != nil {
+		a.setNote("保存配置失败："+err.Error(), false)
+	}
+}
+
+// detectGame re-runs Java / server.jar detection and fills the edit boxes.
+func (a *app) detectGame() {
+	java := mc.FindJava()
+	jar := mc.FindServerJar()
+	a.persistGamePaths(java, jar)
+	switch {
+	case java == "" && jar == "":
+		a.setNote("未找到 Java 和服务器 jar，请手动填写路径", false)
+	case java == "":
+		a.setNote("已找到服务器 jar，未找到 Java，请手动填写", false)
+	case jar == "":
+		a.setNote("已找到 Java，未找到服务器 jar，请手动填写", false)
+	default:
+		a.setNote("已自动检测到 Java 和服务器 jar", true)
+	}
+}
+
+// startGame launches the dedicated server with the given java/jar (the current
+// edit-box contents), falling back to detection when the boxes are empty.
+func (a *app) startGame(java, jar string) {
+	java = strings.TrimSpace(java)
+	jar = strings.TrimSpace(jar)
+	a.mu.Lock()
+	already := a.mcSrv != nil && a.mcSrv.Running()
+	a.mu.Unlock()
+	if already {
+		a.setNote("服务器已经在运行了", false)
+		return
+	}
+	if java == "" {
+		java = mc.FindJava()
+	}
+	if jar == "" {
+		jar = mc.FindServerJar()
+	}
+	if java == "" || jar == "" {
+		a.setNote("请先点“自动检测”或手动填写 Java 与服务器 jar 路径", false)
+		return
+	}
+	srv, err := mc.StartServer(java, jar, a.gameLogf())
+	if err != nil {
+		a.setNote(err.Error(), false)
+		return
+	}
+	a.mu.Lock()
+	a.mcSrv = srv
+	a.mu.Unlock()
+	a.persistGamePaths(java, jar)
+	addr := a.joinableAddr()
+	log.Printf("game: server started (addr %s)", addr)
+	if addr != "" {
+		a.setNote("服务器已启动，可加入地址 "+addr, true)
+	} else {
+		a.setNote("服务器已启动", true)
+	}
+}
+
+// stopGame stops the dedicated server, if one is running.
+func (a *app) stopGame() {
+	a.mu.Lock()
+	srv := a.mcSrv
+	a.mcSrv = nil
+	a.mu.Unlock()
+	if srv == nil {
+		a.setNote("服务器未在运行", false)
+		return
+	}
+	srv.Stop()
+	a.setNote("服务器已停止", true)
+}
+
+// copyGameAddr copies the current joinable address to the clipboard.
+func (a *app) copyGameAddr() {
+	addr := a.joinableAddr()
+	if addr == "" {
+		a.setNote("暂无可复制的地址：请先启动服务器，或加入有房主的房间", false)
+		return
+	}
+	window.CopyToClipboard(a.win.Hwnd(), addr)
+	a.setNote("已复制 "+addr, true)
+}
+
+// addToLauncher registers the current joinable address in the official
+// launcher's multiplayer list (servers.dat), so joining is one click.
+func (a *app) addToLauncher() {
+	addr := a.joinableAddr()
+	if addr == "" {
+		a.setNote("暂无可添加的地址：请先启动服务器，或加入有房主的房间", false)
+		return
+	}
+	name := "Eliauk VPN"
+	a.mu.Lock()
+	ag := a.ag
+	a.mu.Unlock()
+	if ag != nil {
+		if room := ag.RoomState(); room != nil && room.Code != "" {
+			name = "Eliauk [" + room.Code + "]"
+		}
+	}
+	if _, err := mc.AddServerToLauncher(name, addr); err != nil {
+		a.setNote(err.Error(), false)
+		return
+	}
+	a.setNote("已添加服务器 "+name+" → "+addr+"，打开启动器即可加入", true)
+}
+
+// launchGame starts the official Minecraft launcher.
+func (a *app) launchGame() {
+	if err := mc.LaunchLauncher(); err != nil {
+		a.setNote(err.Error(), false)
+		return
+	}
+	a.setNote("已启动 Minecraft 启动器", true)
 }
 
 // saveSettings persists the nickname/server and restarts the agent with them.

@@ -113,11 +113,13 @@ type RoomJoin struct {
 }
 
 // RoomMember is one member of a room, enough for the P2P whitelist (KeyFP) and
-// the virtual LAN (VirtualIP).
+// the virtual LAN (VirtualIP). Host marks the room creator — the one most
+// likely running a game server guests should join.
 type RoomMember struct {
 	Username  string `json:"username"`
 	KeyFP     string `json:"key_fp,omitempty"`
 	VirtualIP string `json:"virtual_ip,omitempty"`
+	Host      bool   `json:"host,omitempty"`
 }
 
 // RoomJoined is the reply to a successful room_join: the code and every current

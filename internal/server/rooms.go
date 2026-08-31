@@ -117,7 +117,7 @@ func (r *Registry) roomMembersLocked(room *Room) []protocol.RoomMember {
 	sort.Strings(names)
 	out := make([]protocol.RoomMember, 0, len(names))
 	for _, u := range names {
-		m := protocol.RoomMember{Username: u}
+		m := protocol.RoomMember{Username: u, Host: u == room.Host}
 		if c, ok := r.byAccount[u]; ok {
 			m.KeyFP = c.KeyFP
 			m.VirtualIP = c.VirtualIP

@@ -7,6 +7,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -34,6 +35,11 @@ type Config struct {
 	// persisted.
 	Account string `json:"account,omitempty"`
 	Token   string `json:"token,omitempty"`
+
+	// M7c game panel: remembered paths so the user sets them once. Empty means
+	// "auto-detect next start".
+	Java     string `json:"java,omitempty"`
+	ServerJar string `json:"server_jar,omitempty"`
 }
 
 // DefaultPath returns the per-user config path. On Windows this is
@@ -57,6 +63,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 	var c Config
+	// Strip a UTF-8 BOM if present — PowerShell's Set-Content -Encoding UTF8
+	// and Notepad write one, and encoding/json rejects it as a stray char.
+	raw = bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf"))
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}

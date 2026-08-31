@@ -22,6 +22,9 @@
 - [x] **M6b 完成（2026-08-31）**：好友白名单 — 只允许白名单内的静态密钥建立会话；未在白名单的 peer 双向被拒 + 其数据帧被丢弃（含不对称白名单场景的 drop-guard）
 - [x] **M6c 完成（2026-08-31）**：Windows 托盘 GUI — 纯 Win32（`syscall.NewLazyDLL`，零新依赖）托盘图标 + 右键状态菜单（身份/VIP/NAT/peers 连接状态/退出），包住 headless agent；`cmd/gui` 与 `cmd/client` 共享 `internal/agent` 内核，双托盘实例 e2e（加密会话 + 数据面 + 退出钩子）验证通过
 - [x] **M6d 完成（2026-08-31）**：傻瓜式主窗口 GUI — 双击即用、零命令行参数；主窗口（昵称/服务器/好友码/好友列表/状态/设置）+ 托盘同泵，配置持久化 `%AppData%\Eliauk\config.json`，UAC 提权自重启，设置变更自动重建 agent 重连；`cmd/genident` 工具 + `e2e-gui.ps1` 全自动双 GUI 脚本 e2e 全绿（注册/会话/数据面/干净退出）
+- [x] **M7a 完成（2026-08-31）**：MCTier 式改造第①档 — 账号+好友+在线状态。服务器端账号（PBKDF2-HMAC-SHA256 密码哈希，100k 迭代，RFC2898）+ 会话 Token（16B 随机 hex，**每次登录轮换**）+ 对称好友图 + 设备指纹绑定（每个账号绑定一组 X25519 指纹）；GUI 登录/注册/退出/按用户名加好友/在线状态。
+- [x] **M7b 完成（2026-08-31）**：MCTier 式改造第②档 — 房间系统（一键加入）。5 位房间码（32 字符表，无 I/O/0/1），加入即互白名单 + 互见 + 自动打洞（**不是好友也能直连**）；离开/掉线自动退房；修了「退房者永远不知道已退」的 bug（新增 `room_left` 消息）。
+- [x] **M7c 完成（2026-08-31）**：MCTier 式改造第③档 — 游戏启动器集成。`internal/mc`（纯 stdlib）：检测 Java/.minecraft/服务器 jar/官方启动器；一键开服（写 eula.txt + 合并 server.properties + `java -jar server.jar nogui`，stdin 输 stop 优雅关服）；servers.dat 的 NBT 注入（gzip→解析→合并{name,ip}→回写，备份 .bak，保留原有条目）；GUI「游戏」面板（Java/jar 自动检测、开服/停服、复制房主地址、添加到启动器、启动游戏）。房主地址 = 房间 Host 的虚拟 IP:25565（`RoomMember.Host` 标记已上线）
 
 ## M2 详情（含踩坑）
 - 架构：协调服务器交换 candidates（`connect_request` → 双向 `connect_candidates`），双方在同一 socket 上各自打洞。
@@ -65,12 +68,12 @@
 - MC Java 走 TCP（25565），隧道把 IP 包/帧塞进 UDP 带走。
 
 ## 运行指南（Quickstart）
-- **协调服务器**（公网 VPS 或本机测试）：
-  `go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网IP>:9091`
-  （注意：本机 8080/8081 被遗留进程占用，测试一律用 9090/9091。）
+- **协调服务器**（公网 VPS 或本机测试，M7 起带账号目录）：
+  `go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网IP>:9091 -accounts <账号目录.json>`
+  （注意：本机 8080/8081 被遗留进程占用，测试一律用 9090/9091。不带 `-accounts` 时账号功能不可用，legacy 匿名模式仍可跑。）
 - **交互式 CLI 客户端**（调试打洞用）：`bin/client.exe -name host -server ws://<server>:9090/ws [-vnic]`
-- **傻瓜式 GUI**（正式使用，M6d）：双击 `bin/gui.exe` 即可。首次使用在主窗口填「昵称」+「服务器地址」（形如 `ws://主机:9090/ws`）点「保存并连接」；好友码点「复制」发给朋友，朋友粘贴到「添加好友」框即可互相连接。设置与好友持久化到 `%AppData%\Eliauk\config.json`（`-config` 可覆盖路径），X25519 身份在 `identity.key`。GUI 默认尝试 UAC 提权自重启以建虚拟网卡（`-no-elevate` 跳过）。release 无控制台版：`go build -ldflags "-H windowsgui" ./cmd/gui`。
-  **自动化钩子**（测试用）：`-exit-after <dur>` 到时自动退出；`-vnic-name` 指定网卡名；`-debug-packets` 打数据面日志。`cmd/genident <keyfile>` 打印/生成身份指纹（e2e 脚本用）。
+- **傻瓜式 GUI**（正式使用，M6d+M7）：双击 `bin/gui.exe` 即可。首次使用在主窗口填「昵称」+「服务器地址」（形如 `ws://主机:9090/ws`）点「保存并连接」。M7 之后推荐**注册账号**：在「账号」组输用户名+密码点「注册」，再点「登录」（登录后 session token 缓存到 config，重启免密）；「好友」组按用户名加好友；「房间」组创建房间 → 把 5 位房间码发给朋友 → 朋友输入房间码点「加入房间」即**自动互连**（不用互加好友）。「游戏」组：自动检测 Java/服务器 jar →「启动服务器」开服 →「复制地址」把房主地址（虚拟 IP:25565）发给朋友 → 朋友「添加服务器」写进启动器多人在线列表即可一键加入。设置与好友持久化到 `%AppData%\Eliauk\config.json`（`-config` 可覆盖路径），X25519 身份在 `identity.key`。GUI 默认尝试 UAC 提权自重启以建虚拟网卡（`-no-elevate` 跳过）。release 无控制台版：`go build -ldflags "-H windowsgui" ./cmd/gui`。
+  **自动化钩子**（测试用）：`-exit-after <dur>` 到时自动退出；`-vnic-name` 指定网卡名；`-debug-packets` 打数据面日志；`-account`/`-password`/`-create-account` 无头登录/注册（带密码即清 token 强制走密码，不带密码用缓存的 token 登录）；`-game-start <jar>` agent 注册后自动开服。`cmd/genident <keyfile>` 打印/生成身份指纹（e2e 脚本用）。
 - **CLI 一键互连（不带 GUI，测试白名单用）**：`cmd/genident` 生成两端指纹 → 各自写 `--friends` 文件（每行一个指纹，`#` 注释）→ `bin/client.exe -name host -server ws://… -vnic --friends friends.txt`。
 - **M9 跨机验证步骤**（真机双端）：
   1. 每台机器装同一 `gui.exe` 或 `client.exe` + 各自的 keyfile；
@@ -110,6 +113,20 @@
 - 测试：TestWhitelistRejectsUnknownPeer / TestWhitelistAcceptsFriend。e2e：互相白名单的 host/join 连接并交换 MC 流量；未白名单的 eve 被双方拒绝（`peer is not in the friends list (fingerprint …)`），双方各 drop eve 的 11 帧数据（`drop data from eve (no session)`）。
 - **已知行为（可接受）**：被拒方（eve）单方面认为自己 connected；数据只单向、在白名单侧被丢弃。
 
+## M7 详情（账号/好友/房间/启动器，MCTier 式，已单测 + 集成测试 + e2e 验证）
+- **服务器端账号**（`internal/server`）：账号按用户名存，密码 PBKDF2-HMAC-SHA256（RFC2898，100k 迭代，格式 `pbkdf2$<salt hex>$<hash hex>`）；**会话 Token** 16B 随机 hex，**每次登录轮换**（`RotateToken`）——旧 token 立即失效；设备 = 账号绑定的 base64 X25519 指纹集合（防换机伪冒，也用于白名单）。认证顺序：**先验 Token 后验密码**。
+- **可见性规则**：账号客户端只看到 好友 ∪ 同房间成员；legacy 匿名客户端（Account==""）仍看到所有人。`connect_request` 受 `reg.VisibleTo` 门控。
+- **对称好友图**：`friend_add` 是双向的（加别人 = 对方也加你）；在线状态 `presence` 推送。好友列表进 `friend_list`。
+- **房间**（`internal/server/rooms.go`）：5 位码（32 字符表无 I/O/0/1）；`Room{Host, Members}` 本来就有 Host（创建者），M7c 才把它暴露到线上（`RoomMember.Host`）；成员 = 在线账号（离线自动退房）。加入房间 → 服务器把每个成员 KeyFP/VirtualIP 下发 → 客户端 `syncWhitelistLocked()` 把 房间成员指纹 并进白名单 → `autoConnect` 自动打洞（**不是好友也能直连 = 一键加入的实质**）。
+- **退房 bug（已修）**：服务器原来只给剩余成员发 `room_update`，退房者自己永远不知道已退出 → 客户端残留房间状态/指纹。修复：新增 `room_left` 消息发给退房者，agent `clearRoom()` 清空房间+roomFP 并重算白名单。
+- **`internal/mc`（纯 stdlib，M7c）**：
+  - 检测：`MinecraftDir`（%AppData%\.minecraft）、`FindJava`（JAVA_HOME → Program Files 浅层 glob（Adoptium/Java/Microsoft/Corretto）→ .minecraft\runtime 深度受限 walk → PATH）、`FindServerJar`（cwd/server.jar 或 .minecraft）、`LauncherExe`。
+  - 一键开服：`PrepareServerDir`（写 eula.txt；server.properties **只补缺省** server-port=25565/online-mode=false/motd，用户已有键保留）+ `StartServer`（`java -Xmx1G -jar <jar> nogui`，stdin 输 `stop` 优雅关服 + Kill 兜底）。
+  - **servers.dat NBT 注入**：手写最小 NBT 读写（gzip → TAG 树，支持全部类型含 Int/LongArray）→ 在 `servers` 列表合并/更新 {name, ip} → 回写前备份 `.bak`，其他条目与根标签原样保留。官方启动器多人在线列表即刻出现该服务器。
+- **GUI 游戏面板（M7c，`internal/window` 520×786）**：Java 路径/服务器 jar 两输入框 + 自动检测、启动/停止服务器、复制地址（= 房主虚拟 IP:25565）、添加到启动器（写 servers.dat）、启动游戏（拉起官方启动器）。路径持久化到 config（`java`/`server_jar`）。`-game-start <jar>` 是自动化钩子：agent 注册后自动开服（e2e 用）。
+- **e2e（`e2e-gui.ps1` 三阶段）**：A) legacy 匿名双 GUI p2p + mcprobe 数据面（不变）；B) `-create-account` 注册 → config 落盘 session token（脱敏检查字节数，不打印 token）→ 仅 `-account` 免密重启登录成功；C) 现场 javac 编译一个「假 MC 服务器」（绑定 25565 的 Java 程序）→ `-game-start` 让 GUI 开服 → 断言 server.properties/eula.txt 写入 + 25565 端口监听 + config 持久化 java/server_jar + **退出后进程和端口一并清干净**。
+- **安全边界**：密码明文从不落盘（只进 `pendingPass`，拿到 token 即忘）；GUI 永不打印 token 原文（e2e 用 `token.Length > 0` 这类脱敏断言）；`online-mode=false` 只写进新建的 server.properties（已存在的用户配置保留）。
+
 ## 下一步（优先级排序）
 1. ~~M1~~ ✅ **完成**
 2. ~~M2~~ ✅ **完成**
@@ -117,13 +134,14 @@
 4. ~~M4~~ ✅ **完成**
 5. ~~M5~~ ✅ **完成**（MC 局域网发现经隧道端到端验证通过，含 /32 路由 + BuildDiscovery + 双向 debug 实锤）
 6. **M6 已完成** ✅：M6a（加密）+ M6b（白名单）+ M6c（托盘 GUI）+ M6d（傻瓜式主窗口 GUI）全部落地并 e2e 验证 —— **核心里程碑收官**
-7. **M9 跨机验证**（下一步）：真机双端跑 `gui.exe`（双击式，互加好友码）或 `mcprobe`，确认发现 + TCP 走公网隧道（同机已验证，跨机是最终确认；顺带覆盖真实 NAT 打洞）
-8. 待定：协调服务器 VPS 选型（用户说「vps最后再搞」）、`ensurePeerRoute` 的对端下线路由清理（目前 route 只加不删，peer 下线后 VIP 包会发向已失效 peer 被丢弃——对 M5 无碍）
-9. **新方向（2026-08-31，用户提出）**：像 MCTier 一样 —— 服务器端账号/好友/房间模型 + 一键加入 + 在线状态 + 可选游戏启动器集成，替代裸指纹互加好友。待与用户确认范围后规划。
+7. **M7 已完成** ✅（MCTier 式改造，2026-08-31）：M7a 账号+好友+在线状态 → M7b 房间一键加入 → M7c 游戏启动器集成，全部落地（单测 + `TestRoomIntegration` 集成测试 + `e2e-gui.ps1` 三阶段 e2e 验证）
+8. **M9 跨机验证**（下一步）：真机双端跑 `gui.exe`（账号注册→建房→分享房间码，或互加好友码）或 `mcprobe`，确认发现 + TCP 走公网隧道（同机已验证，跨机是最终确认；顺带覆盖真实 NAT 打洞）
+9. 待定：协调服务器 VPS 选型（用户说「vps最后再搞」）、`ensurePeerRoute` 的对端下线路由清理（目前 route 只加不删，peer 下线后 VIP 包会发向已失效 peer 被丢弃——对 M5 无碍）
 
 ## 里程碑速览
 M0 文档 ✅ → M1 协调服务器/STUN ✅ → M2 打洞直连 ✅ → M3 中继回退 ✅ → M4 虚拟网卡打通 ✅ → M5 游戏链路（MC 局域网发现）✅
-→ M6 加密(✅ M6a)+好友白名单(✅ M6b)+托盘GUI(✅ M6c)+傻瓜式主窗口GUI(✅ M6d) **全部完成** → M9 跨机验证 → 待定 MCTier 式账号/房间（新方向）
+→ M6 加密(✅ M6a)+好友白名单(✅ M6b)+托盘GUI(✅ M6c)+傻瓜式主窗口GUI(✅ M6d) **全部完成**
+→ M7 MCTier 式改造（✅ M7a 账号/好友/在线状态 + ✅ M7b 房间一键加入 + ✅ M7c 游戏启动器集成）**全部完成** → M9 跨机验证（最终确认）
 
 ## 环境备注
 - Windows 11，开发机；Go 在 `C:\Program Files\Go\bin\go.exe`（新 shell 需用全路径或重设 `$env:Path`）。
