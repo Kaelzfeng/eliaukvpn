@@ -21,9 +21,17 @@ func main() {
 	// server's public IP.
 	relayPublic := flag.String("relay-public", "127.0.0.1:8081", "relay endpoint advertised to clients")
 	relayListen := flag.String("relay-listen", "0.0.0.0:8081", "relay listen address")
+	// accounts is where the M7 account directory persists (users, hashed
+	// passwords, friend graph, session tokens).
+	accountsPath := flag.String("accounts", "accounts.json", "path to the account directory file")
 	flag.Parse()
 
 	reg := server.NewRegistry()
+	acct, err := server.NewAccountStore(*accountsPath)
+	if err != nil {
+		log.Fatalf("load accounts: %v", err)
+	}
+	reg.SetFriendCheck(acct.IsFriend)
 
 	relay, err := server.NewRelay(reg, *relayListen)
 	if err != nil {
@@ -31,9 +39,10 @@ func main() {
 	}
 	defer relay.Close()
 	log.Printf("udp relay listening on %s (advertised as %s)", relay.Addr(), *relayPublic)
+	log.Printf("accounts        : %s (%d users)", *accountsPath, acct.Count())
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		server.HandleWS(reg, *relayPublic, w, r)
+		server.HandleWS(reg, acct, *relayPublic, w, r)
 	})
 
 	// Debug endpoint: dump the registry as JSON.
