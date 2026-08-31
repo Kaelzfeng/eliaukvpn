@@ -15,6 +15,7 @@ package window
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -24,11 +25,17 @@ import (
 
 // ---- window style ----
 const (
-	// Client-area size in pixels (fixed, non-resizable).
+	// Client-area size in pixels (fixed, non-resizable). The outer window is
+	// sized with AdjustWindowRectEx so the client is exactly this big on any
+	// theme, regardless of caption/border metrics. Cards run to x=512, y=790.
 	winW = 520
-	winH = 786
+	winH = 796
 	// WS_OVERLAPPEDWINDOW (0x00CF0000) minus WS_THICKFRAME/WS_MAXIMIZEBOX.
-	winStyle = 0x00CA0000
+	// WS_VISIBLE is included so the window is shown regardless of the process
+	// STARTUPINFO show state: the FIRST ShowWindow call would otherwise be
+	// overridden by the launcher, and a hidden/minimized startup state would
+	// slip through (the SC_MINIMIZE handler hides the window).
+	winStyle = 0x00CA0000 | wsVisible
 )
 
 // ---- Win32 constants used below ----
@@ -121,6 +128,9 @@ const (
 	idcMCAdd      = 130 // 添加到启动器 (servers.dat)
 	idcLaunch     = 131 // 启动游戏 (official launcher)
 	idcGameState  = 132 // game status line
+	// UI rework: header status dot (owner-draw static) + app-name title.
+	idcStatusDot = 133
+	idcTitle     = 134
 )
 
 // EvType is a user action emitted by the window.
@@ -205,18 +215,31 @@ type Window struct {
 	inst uintptr
 	cb   uintptr // WndProc callback, kept alive
 	icon uintptr // taskbar HICON
-	font uintptr // HFONT (stock)
-	sf   uintptr // bold status font
+	font uintptr // body HFONT (Segoe UI)
+	sf   uintptr // status HFONT
+
+	// Theme font set (created in loadFonts).
+	fTitle, fSection, fBody, fLabel, fSmall uintptr
+	// Theme brushes (created in loadThemeBrushes).
+	brBg, brCard, brInput uintptr
 
 	// child controls
-	statusTxt, codeEdit, code2Edit, listBox                                   uintptr
-	copyBtn, addBtn, deleteBtn, nameEdit, serverEdit, saveBtn, quitBtn         uintptr
-	acctEdit, passEdit, loginBtn, registerBtn, logoutBtn, acctStateTxt         uintptr
-	addHintTxt, roomCreateBtn, roomCodeEdit, roomJoinBtn, roomLeaveBtn         uintptr
-	roomStateTxt                                                               uintptr
+	statusTxt, titleTxt, statusDotHwnd                              uintptr
+	codeEdit, code2Edit, listBox                                    uintptr
+	copyBtn, addBtn, deleteBtn, nameEdit, serverEdit, saveBtn, quitBtn uintptr
+	acctEdit, passEdit, loginBtn, registerBtn, logoutBtn, acctStateTxt uintptr
+	addHintTxt, roomCreateBtn, roomCodeEdit, roomJoinBtn, roomLeaveBtn uintptr
+	roomStateTxt                                                      uintptr
 	// M7c game panel controls.
-	javaEdit, jarEdit, gameDetectBtn, srvCopyBtn                               uintptr
-	gameStartBtn, gameStopBtn, mcAddBtn, launchBtn, gameStateTxt               uintptr
+	javaEdit, jarEdit, gameDetectBtn, srvCopyBtn                     uintptr
+	gameStartBtn, gameStopBtn, mcAddBtn, launchBtn, gameStateTxt     uintptr
+
+	// Owner-draw plumbing.
+	buttons      []uintptr        // created in createControls, subclassed after
+	btnCallbacks []uintptr        // kept alive so hover/press procs survive
+	statusDot    int8             // 0=connecting/neutral, 1=good, 2=bad
+	staticColors map[uintptr]uint32 // per-static text color (WM_CTLCOLORSTATIC)
+	staticFonts  map[uintptr]uintptr // per-static font
 
 	mu         sync.Mutex
 	pending    View
@@ -230,8 +253,10 @@ type Window struct {
 // New constructs an unstarted window. Call Run on the UI thread.
 func New() (*Window, error) {
 	return &Window{
-		evCh:   make(chan EvMsg, 16),
-		doneCh: make(chan struct{}),
+		evCh:         make(chan EvMsg, 16),
+		doneCh:       make(chan struct{}),
+		staticColors: make(map[uintptr]uint32),
+		staticFonts:  make(map[uintptr]uintptr),
 	}, nil
 }
 
@@ -284,8 +309,13 @@ func (w *Window) Done() <-chan struct{} { return w.doneCh }
 // Run creates the window and pumps messages until Stop is called. It must run
 // on the goroutine that owns the UI thread; it blocks.
 func (w *Window) Run() error {
+	// System-DPI-aware so the fixed 520x786 layout renders crisp (no blurry
+	// bitmap scaling) on scaled displays. Must precede any window creation.
+	procSetProcessDPIAware.Call()
+
 	w.cb = syscall.NewCallback(w.wndProc)
 	w.loadFonts()
+	w.loadThemeBrushes()
 	if err := w.loadWindowIcon(); err != nil {
 		_ = err // non-fatal: window works without a custom taskbar icon
 	}
@@ -301,6 +331,7 @@ func (w *Window) Run() error {
 		lpfnWndProc: w.cb,
 		hInstance:   w.inst,
 		hIcon:       w.icon,
+		hbrBgnd:     w.brBg, // dark class background so every child erases dark
 		lpszClass:   uintptr(unsafe.Pointer(className)),
 	}
 	if r, _, e := procRegisterClassW.Call(uintptr(unsafe.Pointer(wc))); r == 0 {
@@ -309,16 +340,23 @@ func (w *Window) Run() error {
 		}
 	}
 
+	// Size the outer window so the client area is exactly winW×winH on this
+	// theme's caption/border metrics (fixed dialog-style window, no resize).
+	var wr rect
+	wr.right, wr.bottom = winW, winH
+	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&wr)), uintptr(winStyle), 0, 0)
+	outerW, outerH := wr.right-wr.left, wr.bottom-wr.top
+
 	title, _ := syscall.UTF16PtrFromString("Eliauk VPN")
 	hwnd, _, e2 := procCreateWindowExW.Call(
 		0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(title)),
-		uintptr(winStyle), 0x80000000, 0x80000000, winW, winH,
+		uintptr(winStyle), 0x80000000, 0x80000000, uintptr(outerW), uintptr(outerH),
 		0, 0, w.inst, 0)
 	if hwnd == 0 {
 		return fmt.Errorf("CreateWindowExW: %v", e2)
 	}
 	w.hwnd = hwnd
-
+	applyImmersiveDark(hwnd) // dark caption bar
 	w.createControls()
 	w.applyFonts()
 	w.mu.Lock()
@@ -367,20 +405,9 @@ func (w *Window) wndProc(hwnd uintptr, m uint32, wParam, lParam uintptr) uintptr
 		return 0
 	case wmCommand:
 		return w.onCommand(wParam)
-	case wmCtlColorStatic:
-		if uintptr(wParam) == w.statusTxt {
-			w.mu.Lock()
-			good := w.statusGood
-			w.mu.Unlock()
-			color := uintptr(colorGreen)
-			if !good {
-				color = uintptr(colorRed)
-			}
-			procSetTextColor.Call(lParam, color)
-			procSetBkMode.Call(lParam, 1) // TRANSPARENT
-			brush, _, _ := procGetSysColorBrush.Call(colorBtnFace)
-			return brush
-		}
+	case wmEraseBkgnd, wmPaint, wmDrawItem, wmCtlColorStatic, wmCtlColorEdit, wmCtlColorListbox:
+		r, _ := w.themeMessage(m, wParam, lParam)
+		return r
 	case wmSysCommand:
 		if wParam&0xFFF0 == scMinimize {
 			procShowWindow.Call(hwnd, swHide) // minimize hides to the tray
@@ -493,6 +520,15 @@ func (w *Window) applyView(v View) {
 	changed := w.statusGood != v.Good
 	w.statusGood = v.Good
 	w.mu.Unlock()
+
+	// Status dot: good=green, an in-flight "连接" attempt=neutral, else red.
+	dot := int8(2)
+	if v.Good {
+		dot = 1
+	} else if strings.Contains(v.Status, "连接") {
+		dot = 0
+	}
+	w.setStatusDot(dot)
 	if changed {
 		procInvalidateRect.Call(w.statusTxt, 0, 1)
 	}
@@ -538,92 +574,127 @@ func (w *Window) create(cls, text string, style uintptr, x, y, wd, ht int32, id 
 	return h
 }
 
-func (w *Window) createControls() {
-	w.statusTxt = w.create("STATIC", "Eliauk VPN", 0, 12, 10, 496, 24, idcStatus)
-
-	w.create("BUTTON", "账号", bsGroupBox, 8, 36, 504, 82, 0)
-	w.create("STATIC", "账号", 0, 16, 52, 40, 20, 0)
-	w.acctEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 58, 50, 140, 22, idcAccount)
-	w.create("STATIC", "密码", 0, 206, 52, 40, 20, 0)
-	w.passEdit = w.create("EDIT", "", wsBorder|esPassword|wsTabStop, 248, 50, 128, 22, idcPass)
-	w.loginBtn = w.create("BUTTON", "登录", bsPushButton|wsTabStop, 384, 48, 56, 26, idcLogin)
-	w.registerBtn = w.create("BUTTON", "注册", bsPushButton|wsTabStop, 444, 48, 60, 26, idcRegister)
-	w.acctStateTxt = w.create("STATIC", "未登录", 0, 16, 86, 330, 18, idcAcctState)
-	w.logoutBtn = w.create("BUTTON", "退出登录", bsPushButton|wsTabStop, 384, 84, 120, 24, idcLogout)
-
-	w.create("BUTTON", "好友", bsGroupBox, 8, 122, 504, 100, 0)
-	w.create("STATIC", "我的好友码", 0, 16, 140, 70, 18, 0)
-	w.codeEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|esReadOnly|wsTabStop, 88, 138, 320, 22, idcCode)
-	w.copyBtn = w.create("BUTTON", "复制", bsPushButton|wsTabStop, 416, 136, 88, 26, idcCopy)
-	w.create("STATIC", "添加好友", 0, 16, 174, 70, 18, 0)
-	w.code2Edit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 88, 172, 320, 22, idcCode2)
-	w.addBtn = w.create("BUTTON", "添加", bsPushButton|wsTabStop, 416, 170, 88, 26, idcAdd)
-	w.addHintTxt = w.create("STATIC", "输入对方的用户名（账号）即可添加", 0, 16, 200, 488, 18, idcAddHint)
-
-	w.create("BUTTON", "房间", bsGroupBox, 8, 226, 504, 78, 0)
-	w.roomCreateBtn = w.create("BUTTON", "创建房间", bsPushButton|wsTabStop, 16, 246, 92, 26, idcRoomCreate)
-	w.create("STATIC", "房间码", 0, 116, 250, 46, 18, 0)
-	w.roomCodeEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 164, 244, 110, 22, idcRoomCode)
-	w.roomJoinBtn = w.create("BUTTON", "加入房间", bsPushButton|wsTabStop, 282, 244, 92, 26, idcRoomJoin)
-	w.roomLeaveBtn = w.create("BUTTON", "离开房间", bsPushButton|wsTabStop, 282, 244, 92, 26, idcRoomLeave)
-	w.roomStateTxt = w.create("STATIC", "未加入房间", 0, 16, 278, 488, 18, idcRoomState)
-
-	w.create("BUTTON", "游戏", bsGroupBox, 8, 308, 504, 118, 0)
-	w.create("STATIC", "Java 路径", 0, 16, 328, 64, 20, 0)
-	w.javaEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 82, 326, 300, 22, idcJavaEdit)
-	w.gameDetectBtn = w.create("BUTTON", "自动检测", bsPushButton|wsTabStop, 388, 324, 112, 26, idcGameDetect)
-	w.create("STATIC", "服务器 jar", 0, 16, 356, 64, 20, 0)
-	w.jarEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 82, 354, 300, 22, idcJarEdit)
-	w.srvCopyBtn = w.create("BUTTON", "复制地址", bsPushButton|wsTabStop, 388, 352, 112, 26, idcSrvCopy)
-	w.gameStartBtn = w.create("BUTTON", "启动服务器", bsPushButton|wsTabStop, 16, 386, 112, 26, idcGameStart)
-	w.gameStopBtn = w.create("BUTTON", "停止服务器", bsPushButton|wsTabStop, 136, 386, 112, 26, idcGameStop)
-	w.mcAddBtn = w.create("BUTTON", "添加服务器", bsPushButton|wsTabStop, 256, 386, 112, 26, idcMCAdd)
-	w.launchBtn = w.create("BUTTON", "启动游戏", bsPushButton|wsTabStop, 376, 386, 112, 26, idcLaunch)
-	w.gameStateTxt = w.create("STATIC", "未运行", 0, 16, 418, 488, 18, idcGameState)
-
-	w.create("BUTTON", "连接状态", bsGroupBox, 8, 430, 504, 210, 0)
-	w.listBox = w.create("LISTBOX", "", wsBorder|wsVScroll|lbsNotify, 16, 448, 488, 160, idcList)
-	w.deleteBtn = w.create("BUTTON", "删除选中好友", bsPushButton|wsTabStop, 16, 614, 120, 26, idcDelete)
-
-	w.create("BUTTON", "设置", bsGroupBox, 8, 644, 504, 118, 0)
-	w.create("STATIC", "昵称", 0, 16, 664, 40, 20, 0)
-	w.nameEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 58, 662, 150, 22, idcName)
-	w.create("STATIC", "服务器", 0, 218, 664, 50, 20, 0)
-	w.serverEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 270, 662, 232, 22, idcServer)
-	w.create("STATIC", "首次使用：填写昵称与服务器地址后点保存。服务器地址形如 ws://主机:9090/ws", 0, 16, 692, 488, 18, 0)
-	w.saveBtn = w.create("BUTTON", "保存并连接", bsPushButton|wsTabStop, 16, 720, 120, 28, idcSave)
-	w.quitBtn = w.create("BUTTON", "退出", bsPushButton|wsTabStop, 392, 720, 80, 28, idcQuit)
+// label creates a themed STATIC: colored text with a per-static font, both
+// served by WM_CTLCOLORSTATIC. Returns the HWND.
+func (w *Window) label(text string, x, y, wd, ht int32, color uint32, font uintptr) uintptr {
+	h := w.create("STATIC", text, 0, x, y, wd, ht, 0)
+	w.staticColors[h] = color
+	w.staticFonts[h] = font
+	return h
 }
 
-// loadFonts picks the stock GUI font for all controls and a bold face for the
-// status line.
-func (w *Window) loadFonts() {
-	w.font, _, _ = procGetStockObject.Call(defaultGuiFont)
-	face, _ := syscall.UTF16PtrFromString("Segoe UI")
-	h, _, _ := procCreateFontW.Call(
-		^uintptr(18), 0, 0, 0, 700, 0, 0, 0, 1, // height=-19, weight(700=Bold), DEFAULT_CHARSET
-		0, 0, 5, 0, uintptr(unsafe.Pointer(face)))
-	if h != 0 {
-		w.sf = h
-	} else {
-		w.sf = w.font
+// button creates an owner-draw push button. Buttons are subclassed for
+// hover/press feedback at the end of createControls.
+func (w *Window) button(text string, x, y, wd, ht int32, id uintptr) uintptr {
+	h := w.create("BUTTON", text, bsPushButton|bsOwnerDraw|wsTabStop, x, y, wd, ht, id)
+	w.buttons = append(w.buttons, h)
+	return h
+}
+
+func (w *Window) createControls() {
+	// Header strip (on the window background): app name, status dot, status line.
+	w.titleTxt = w.label("Eliauk VPN", 16, 7, 150, 26, colText, w.fTitle)
+	w.statusDotHwnd = w.create("STATIC", "", ssOwnerDraw, 176, 15, 14, 14, idcStatusDot)
+	w.statusTxt = w.create("STATIC", "", 0, 198, 10, 306, 22, idcStatus)
+
+	// 账号 (card 44..136; title band 58..76, content 76..134)
+	w.label("账号", 24, 82, 40, 18, colMuted, w.fLabel)
+	w.acctEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 70, 78, 130, 24, idcAccount)
+	w.label("密码", 208, 82, 40, 18, colMuted, w.fLabel)
+	w.passEdit = w.create("EDIT", "", wsBorder|esPassword|wsTabStop, 252, 78, 120, 24, idcPass)
+	w.loginBtn = w.button("登录", 380, 76, 54, 28, idcLogin)
+	w.registerBtn = w.button("注册", 440, 76, 60, 28, idcRegister)
+	w.acctStateTxt = w.label("未登录", 24, 108, 340, 18, colMuted, w.fSmall)
+	w.logoutBtn = w.button("退出登录", 380, 106, 120, 28, idcLogout)
+
+	// 好友 (card 142..258; title band 156..174, content 172..256)
+	w.label("我的好友码", 24, 178, 76, 18, colMuted, w.fLabel)
+	w.codeEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|esReadOnly|wsTabStop, 104, 174, 290, 24, idcCode)
+	w.copyBtn = w.button("复制", 400, 172, 96, 28, idcCopy)
+	w.label("添加好友", 24, 208, 76, 18, colMuted, w.fLabel)
+	w.code2Edit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 104, 204, 290, 24, idcCode2)
+	w.addBtn = w.button("添加", 400, 202, 96, 28, idcAdd)
+	w.addHintTxt = w.label("输入对方的用户名（账号）即可添加", 24, 238, 472, 18, colMuted, w.fSmall)
+
+	// 房间 (card 264..352; title band 278..296, content 296..348)
+	w.roomCreateBtn = w.button("创建房间", 24, 296, 92, 28, idcRoomCreate)
+	w.label("房间码", 124, 302, 46, 18, colMuted, w.fLabel)
+	w.roomCodeEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 172, 296, 100, 24, idcRoomCode)
+	w.roomJoinBtn = w.button("加入房间", 280, 296, 92, 28, idcRoomJoin)
+	w.roomLeaveBtn = w.button("离开房间", 280, 296, 92, 28, idcRoomLeave)
+	w.roomStateTxt = w.label("未加入房间", 24, 330, 472, 18, colMuted, w.fSmall)
+
+	// 游戏 (card 358..506; title band 372..390, content 388..500)
+	w.label("Java 路径", 24, 394, 66, 18, colMuted, w.fLabel)
+	w.javaEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 94, 390, 300, 24, idcJavaEdit)
+	w.gameDetectBtn = w.button("自动检测", 400, 388, 96, 28, idcGameDetect)
+	w.label("服务器 jar", 24, 422, 66, 18, colMuted, w.fLabel)
+	w.jarEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 94, 418, 300, 24, idcJarEdit)
+	w.srvCopyBtn = w.button("复制地址", 400, 416, 96, 28, idcSrvCopy)
+	w.gameStartBtn = w.button("启动服务器", 24, 446, 104, 28, idcGameStart)
+	w.gameStopBtn = w.button("停止服务器", 24, 446, 104, 28, idcGameStop)
+	w.mcAddBtn = w.button("添加服务器", 136, 446, 104, 28, idcMCAdd)
+	w.launchBtn = w.button("启动游戏", 248, 446, 104, 28, idcLaunch)
+	w.gameStateTxt = w.label("未运行", 24, 482, 472, 18, colMuted, w.fSmall)
+
+	// 连接状态 (card 512..668; title band 526..544, content 546..666)
+	w.listBox = w.create("LISTBOX", "", wsBorder|wsVScroll|lbsNotify, 24, 546, 472, 88, idcList)
+	w.deleteBtn = w.button("删除选中好友", 24, 638, 120, 28, idcDelete)
+
+	// 设置 (card 674..790; title band 688..706, content 706..782)
+	w.label("昵称", 24, 710, 36, 18, colMuted, w.fLabel)
+	w.nameEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 64, 706, 130, 24, idcName)
+	w.label("服务器", 204, 710, 44, 18, colMuted, w.fLabel)
+	w.serverEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 252, 706, 244, 24, idcServer)
+	w.label("首次使用：填写昵称与服务器地址后点保存。服务器地址形如 ws://主机:9090/ws", 24, 736, 472, 18, colMuted, w.fSmall)
+	w.saveBtn = w.button("保存并连接", 24, 754, 120, 28, idcSave)
+	w.quitBtn = w.button("退出", 392, 754, 88, 28, idcQuit)
+
+	// Native controls: dark internal theme (borders, listbox selection).
+	applyDarkThemeControl(w.acctEdit)
+	applyDarkThemeControl(w.passEdit)
+	applyDarkThemeControl(w.codeEdit)
+	applyDarkThemeControl(w.code2Edit)
+	applyDarkThemeControl(w.roomCodeEdit)
+	applyDarkThemeControl(w.javaEdit)
+	applyDarkThemeControl(w.jarEdit)
+	applyDarkThemeControl(w.nameEdit)
+	applyDarkThemeControl(w.serverEdit)
+	applyDarkThemeControl(w.listBox)
+
+	// Owner-draw buttons: subclass to track hover/press.
+	for _, b := range w.buttons {
+		w.subclassButton(b)
 	}
+}
+
+// loadFonts builds the theme font set in Segoe UI. w.font stays the body face
+// for any legacy callers.
+func (w *Window) loadFonts() {
+	w.fTitle = makeFont(20, 700)
+	w.fSection = makeFont(15, 600)
+	w.fBody = makeFont(14, 400)
+	w.fLabel = makeFont(13, 400)
+	w.fSmall = makeFont(12, 400)
+	w.sf = makeFont(14, 600) // status line
+	w.font = w.fBody
 }
 
 func (w *Window) applyFonts() {
-	for _, h := range []uintptr{
-		w.statusTxt, w.codeEdit, w.code2Edit, w.listBox,
-		w.copyBtn, w.addBtn, w.deleteBtn, w.nameEdit, w.serverEdit,
-		w.saveBtn, w.quitBtn,
-		w.acctEdit, w.passEdit, w.loginBtn, w.registerBtn, w.logoutBtn,
-		w.acctStateTxt, w.addHintTxt, w.roomCreateBtn, w.roomCodeEdit,
-		w.roomJoinBtn, w.roomLeaveBtn, w.roomStateTxt,
-		w.javaEdit, w.jarEdit, w.gameDetectBtn, w.srvCopyBtn,
-		w.gameStartBtn, w.gameStopBtn, w.mcAddBtn, w.launchBtn, w.gameStateTxt,
-	} {
-		procSendMessageW.Call(h, wmSetFont, w.font, 1)
+	for h, f := range w.staticFonts {
+		procSendMessageW.Call(h, wmSetFont, f, 1)
 	}
 	procSendMessageW.Call(w.statusTxt, wmSetFont, w.sf, 1)
+	for _, h := range []uintptr{
+		w.codeEdit, w.code2Edit, w.nameEdit, w.serverEdit,
+		w.acctEdit, w.passEdit, w.roomCodeEdit, w.javaEdit, w.jarEdit,
+	} {
+		procSendMessageW.Call(h, wmSetFont, w.fBody, 1)
+	}
+	for _, b := range w.buttons {
+		procSendMessageW.Call(b, wmSetFont, w.fBody, 1)
+	}
+	procSendMessageW.Call(w.listBox, wmSetFont, w.fBody, 1)
 }
 
 // loadWindowIcon loads the runtime-drawn ICO as the taskbar icon and assigns
