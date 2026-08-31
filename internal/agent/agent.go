@@ -595,6 +595,16 @@ func (a *Agent) updateRoomMembers(members []protocol.RoomMember) {
 	a.syncWhitelistLocked()
 }
 
+// clearRoom leaves the current room: drop the room state and the room-sourced
+// whitelist entries (the server has already removed us from the room).
+func (a *Agent) clearRoom() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.room = nil
+	a.roomFP = nil
+	a.syncWhitelistLocked()
+}
+
 // memberFPs extracts the fingerprints of every member except self.
 func memberFPs(self string, members []protocol.RoomMember) [][]byte {
 	var out [][]byte
@@ -657,6 +667,10 @@ func (a *Agent) messageLoop() {
 			var ru protocol.RoomUpdate
 			_ = json.Unmarshal(env.Data, &ru)
 			a.updateRoomMembers(ru.Members)
+		case protocol.TypeRoomLeft:
+			// The server removed us from our room: drop the room state and the
+			// room-sourced whitelist entries so we stop punching room members.
+			a.clearRoom()
 		case protocol.TypeError:
 			var e protocol.Error
 			_ = json.Unmarshal(env.Data, &e)

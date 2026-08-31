@@ -280,7 +280,9 @@ func handleRoomJoin(reg *Registry, acct *AccountStore, client *Client, data json
 	broadcastPeers(reg, acct)
 }
 
-// handleRoomLeave leaves the current room (if any) and notifies the rest.
+// handleRoomLeave leaves the current room (if any) and notifies the rest. The
+// leaver gets a direct room_left so it can drop its room state and the
+// room-sourced P2P whitelist entries; the remaining members get a room_update.
 func handleRoomLeave(reg *Registry, acct *AccountStore, client *Client) {
 	if client.Account == "" {
 		return
@@ -291,6 +293,7 @@ func handleRoomLeave(reg *Registry, acct *AccountStore, client *Client) {
 		return
 	}
 	log.Printf("room: %s left %s", client.Account, room.Code)
+	_ = sendClient(client, protocol.TypeRoomLeft, protocol.RoomLeft{Code: room.Code})
 	notifyRoom(reg, room)
 	broadcastPeers(reg, acct)
 }

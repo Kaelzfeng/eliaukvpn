@@ -35,6 +35,7 @@ const (
 	TypeRoomJoined = "room_joined"  // server -> joiner: room code + members
 	TypeRoomLeave  = "room_leave"   // client -> server
 	TypeRoomUpdate = "room_update"  // server -> every member: current member list
+	TypeRoomLeft   = "room_left"    // server -> the leaver: you are out of your room
 )
 
 // RegisterRequest is the first message a client sends. M7 accounts extend it:
@@ -130,6 +131,13 @@ type RoomJoined struct {
 // (someone joined, left, or disconnected).
 type RoomUpdate struct {
 	Members []RoomMember `json:"members"`
+}
+
+// RoomLeft is sent to a client that left its room so it can drop the room
+// state (and the room-sourced P2P whitelist entries) on its own side. The
+// remaining members get a room_update instead.
+type RoomLeft struct {
+	Code string `json:"code"`
 }
 
 // Candidate is one punchable address (public or LAN) of a client.
