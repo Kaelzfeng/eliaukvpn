@@ -16,12 +16,14 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"eliaukvpn/internal/crypto"
 	"eliaukvpn/internal/lan"
 	"eliaukvpn/internal/p2p"
 	"eliaukvpn/internal/protocol"
@@ -47,11 +49,21 @@ func run() error {
 		lanEmu        = flag.Bool("lan", true, "emulate Minecraft LAN discovery (UDP 4445 broadcast fan-out)")
 		headless      = flag.Bool("headless", false, "run as a background agent without the interactive command loop")
 		debugPackets  = flag.Bool("debug-packets", false, "log every packet flowing between the virtual NIC and the tunnel")
+		keyfile       = flag.String("keyfile", defaultKeyfile(), "path to the X25519 identity key (created on first run)")
 	)
 	flag.Parse()
 	if *name == "" {
 		return fmt.Errorf("--name is required (e.g. --name alice)")
 	}
+
+	// 0. Load (or create) the long-term X25519 identity. This authenticates the
+	//    handshake to friends and encrypts all tunnel data (M6). Share the
+	//    fingerprint printed below so friends can whitelist us.
+	identity, err := crypto.LoadOrCreate(*keyfile)
+	if err != nil {
+		return fmt.Errorf("load identity %q: %w", *keyfile, err)
+	}
+	fmt.Printf("identity        : %s\n", identity.Fingerprint())
 
 	// 1. Open the P2P socket FIRST — hole punching must use the same socket
 	//    whose public mapping we advertise, so the STUN probe runs on it.
@@ -230,6 +242,7 @@ func run() error {
 				mu.Lock()
 				myVIP = reg.VirtualIP
 				tunnel = p2p.New(p2pConn, myID, log.Printf)
+				tunnel.SetIdentity(identity)
 				go tunnel.Run()
 				if reg.RelayAddr != "" {
 					if err := tunnel.SetRelay(reg.RelayAddr); err != nil {
@@ -429,6 +442,15 @@ func run() error {
 		}
 	}
 	return scanner.Err()
+}
+
+// defaultKeyfile returns the default identity key path for this user. On
+// Windows this is %AppData%\Eliauk\identity.key.
+func defaultKeyfile() string {
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "Eliauk", "identity.key")
+	}
+	return "identity.key"
 }
 
 // stunProbeOn runs NAT detection on an existing socket, degrading gracefully

@@ -4,12 +4,16 @@
 package p2p
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
+
+	"eliaukvpn/internal/crypto"
 )
 
 // State of a peer connection.
@@ -56,6 +60,16 @@ type Peer struct {
 	candidates []*net.UDPAddr
 	relayed    bool // frames are carried through the relay server (M3)
 	lastPing   time.Time
+
+	// M6 encryption state. eph is our ephemeral key for this connection (fresh
+	// per connection for forward secrecy), handshake is our public message
+	// (eph||static) carried in hello/helloAck, and session is the negotiated
+	// symmetric key once both handshake messages have been seen. The session
+	// derivation is role-independent, so a simultaneous punch (both sides send
+	// hello) still agrees on one key.
+	eph       *ecdh.PrivateKey
+	handshake *crypto.Handshake
+	session   *crypto.Session
 }
 
 // Snapshot is a concurrency-safe view of a peer for display.
@@ -72,12 +86,13 @@ type Tunnel struct {
 	conn *net.UDPConn
 	myID string // hex client id
 
-	mu        sync.Mutex
-	peers     map[string]*Peer
-	relayAddr *net.UDPAddr // relay server endpoint (M3); nil = no relay
-	forceRelay bool        // skip direct punching entirely (testing / NAT known symmetric)
-	dataSink  func(pkt []byte) // receives IP packets decapsulated from peers (M4)
-	logf      func(format string, args ...any)
+	mu         sync.Mutex
+	peers      map[string]*Peer
+	relayAddr  *net.UDPAddr     // relay server endpoint (M3); nil = no relay
+	forceRelay bool             // skip direct punching entirely (testing / NAT known symmetric)
+	dataSink   func(pkt []byte) // receives IP packets decapsulated from peers (M4)
+	logf       func(format string, args ...any)
+	identity   *crypto.Identity // M6: long-term X25519 identity; nil = legacy cleartext
 }
 
 // New creates a tunnel on conn. myID is this client's hex id.
@@ -107,6 +122,15 @@ func (t *Tunnel) Run() {
 	}
 }
 
+// SetIdentity installs the long-term X25519 identity used to authenticate
+// handshakes and encrypt data frames (M6). Until it is set, the tunnel runs in
+// legacy cleartext mode. Install before any BeginConnect.
+func (t *Tunnel) SetIdentity(id *crypto.Identity) {
+	t.mu.Lock()
+	t.identity = id
+	t.mu.Unlock()
+}
+
 // BeginConnect registers a peer and starts punching toward its candidates.
 // Safe to call both when we initiated the connection and when a peer asked
 // the coordination server to connect to us.
@@ -119,6 +143,22 @@ func (t *Tunnel) BeginConnect(peerID, peerName string, candidates []*net.UDPAddr
 	p := &Peer{ID: peerID, Name: peerName, State: StateConnecting, candidates: candidates}
 	if t.forceRelay {
 		p.relayed = true
+	}
+	if t.identity != nil {
+		// Generate the per-connection ephemeral key once and reuse it across
+		// hello retransmissions — the responder must see a stable initiator key
+		// so it can derive the same session on its first hello and reuse it on
+		// the retransmits.
+		eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.logf("p2p: generate ephemeral for %s: %v", peerID, err)
+		} else {
+			p.eph = eph
+			p.handshake = &crypto.Handshake{
+				Eph:  append([]byte(nil), eph.PublicKey().Bytes()...),
+				Stat: t.identity.PublicKey(),
+			}
+		}
 	}
 	t.peers[peerID] = p
 	t.mu.Unlock()
@@ -247,6 +287,10 @@ func (t *Tunnel) punchLoop(p *Peer) {
 		id := p.ID
 		cands := append([]*net.UDPAddr(nil), p.candidates...)
 		relayed := p.relayed
+		var helloPayload []byte
+		if p.handshake != nil {
+			helloPayload = p.handshake.Marshal()
+		}
 		t.mu.Unlock()
 
 		if relayed {
@@ -254,7 +298,7 @@ func (t *Tunnel) punchLoop(p *Peer) {
 				inRelay = true
 				relayDeadline = time.Now().Add(punchTimeout)
 			}
-			t.sendRelayFrame(frameHello, id)
+			t.sendRelayFrame(frameHello, id, helloPayload)
 			if time.Now().After(relayDeadline) {
 				t.mu.Lock()
 				if p.State == StateConnecting {
@@ -266,7 +310,7 @@ func (t *Tunnel) punchLoop(p *Peer) {
 			}
 		} else {
 			for _, c := range cands {
-				t.sendFrame(frameHello, id, c)
+				t.sendFrame(frameHello, id, c, helloPayload)
 			}
 			if time.Now().After(directDeadline) {
 				t.mu.Lock()
@@ -312,6 +356,20 @@ func (t *Tunnel) handleFrame(f *frame, addr *net.UDPAddr) {
 
 	switch f.typ {
 	case frameHello:
+		// M6: as the responder, derive the session from the initiator's hello
+		// (ephemeral||static). Retransmitted hellos are idempotent — the session
+		// is kept from the first one and reused. If identity is nil (legacy
+		// mode) the handshake is skipped and helloAck carries no payload.
+		var ackPayload []byte
+		if t.identity != nil {
+			if err := t.responderHandshake(p, f.payload); err != nil {
+				t.logf("p2p: handshake with %s rejected: %v", p.Name, err)
+				return
+			}
+			if p.handshake != nil {
+				ackPayload = p.handshake.Marshal()
+			}
+		}
 		if p.State != StateConnected {
 			p.State = StateConnected
 			where := "direct"
@@ -320,37 +378,135 @@ func (t *Tunnel) handleFrame(f *frame, addr *net.UDPAddr) {
 			}
 			t.logf("p2p: connected to %s (%s, %s)", p.Name, addr, where)
 		}
-		t.sendFrameLocked(frameHelloAck, p)
+		t.sendFrameLocked(frameHelloAck, p, ackPayload)
 		p.lastPing = time.Now()
-		t.sendFrameLocked(framePing, p)
+		t.sendFrameLocked(framePing, p, nil)
 	case frameHelloAck:
+		// M6: as the initiator, complete the session with the responder's
+		// helloAck payload. Retransmitted acks are idempotent (session set).
+		if t.identity != nil && p.session == nil {
+			if err := t.initiatorHandshake(p, f.payload); err != nil {
+				t.logf("p2p: handshake with %s rejected: %v", p.Name, err)
+				return
+			}
+		}
 		if p.State != StateConnected {
 			p.State = StateConnected
 			t.logf("p2p: connected to %s (%s)", p.Name, addr)
 			p.lastPing = time.Now()
-			t.sendFrameLocked(framePing, p)
+			t.sendFrameLocked(framePing, p, nil)
 		}
 	case framePing:
-		t.sendFrameLocked(framePong, p)
+		t.sendFrameLocked(framePong, p, nil)
 	case framePong:
 		rtt := time.Since(p.lastPing)
 		t.logf("p2p: tunnel to %s RTT=%s", p.Name, rtt.Round(time.Microsecond))
 	case frameData:
+		pkt := f.payload
+		if p.session != nil {
+			var err error
+			pkt, err = p.session.Open(peerAAD(f.sender, f.target), f.payload)
+			if err != nil {
+				t.logf("p2p: decrypt from %s: %v", p.Name, err)
+				return
+			}
+		}
 		if t.dataSink != nil {
-			t.dataSink(f.payload)
+			t.dataSink(pkt)
 		}
 	}
 }
 
+// responderHandshake derives our side of the session from the peer's hello
+// payload. Called on every hello, but the session is established once and
+// reused for retransmitted hellos.
+//
+// The ephemeral is NOT regenerated here: BeginConnect created one per
+// connection, and both sides use that single key for their hello, their
+// helloAck, and the session derivation. In a simultaneous punch both sides run
+// this on the other's hello, and because the derivation is role-independent
+// they arrive at the same key. Generating a second ephemeral here would break
+// the agreement (each side would use a different combination of keys).
+func (t *Tunnel) responderHandshake(p *Peer, payload []byte) error {
+	if p.session != nil {
+		return nil // already established
+	}
+	if p.eph == nil {
+		return errors.New("no local ephemeral")
+	}
+	var peerHS crypto.Handshake
+	if err := peerHS.Unmarshal(payload); err != nil {
+		return fmt.Errorf("malformed hello handshake: %w", err)
+	}
+	if err := t.checkPeerStatic(peerHS.Stat); err != nil {
+		return err
+	}
+	sess, err := crypto.NewSession(t.identity, p.eph, peerHS.Eph, peerHS.Stat)
+	if err != nil {
+		return err
+	}
+	p.session = sess
+	t.logf("p2p: session established with %s (responder)", p.Name)
+	return nil
+}
+
+// initiatorHandshake completes the session with the responder's helloAck
+// payload. Only runs once per connection (the initiator's ephemeral was created
+// in BeginConnect and its session is set on the first ack).
+func (t *Tunnel) initiatorHandshake(p *Peer, payload []byte) error {
+	if p.eph == nil {
+		return errors.New("no initiator ephemeral")
+	}
+	var peerHS crypto.Handshake
+	if err := peerHS.Unmarshal(payload); err != nil {
+		return fmt.Errorf("malformed helloAck handshake: %w", err)
+	}
+	if err := t.checkPeerStatic(peerHS.Stat); err != nil {
+		return err
+	}
+	sess, err := crypto.NewSession(t.identity, p.eph, peerHS.Eph, peerHS.Stat)
+	if err != nil {
+		return err
+	}
+	p.session = sess
+	t.logf("p2p: session established with %s (initiator)", p.Name)
+	return nil
+}
+
+// checkPeerStatic validates a peer's static identity key. Whitelist enforcement
+// (M6b) is added here.
+func (t *Tunnel) checkPeerStatic(stat []byte) error {
+	if _, err := ecdh.X25519().NewPublicKey(stat); err != nil {
+		return fmt.Errorf("peer static key invalid: %w", err)
+	}
+	return nil
+}
+
+// peerAAD returns the authenticated data bound to each data frame: the two
+// client IDs in a canonical (sorted) order, so both endpoints derive the same
+// value regardless of which side sent first. Binding the peer pair to the
+// ciphertext prevents a captured frame from being replayed at a different peer.
+func peerAAD(a, b string) []byte {
+	if a > b {
+		a, b = b, a
+	}
+	return []byte("ELK1|" + a + "|" + b)
+}
+
 // sendFrameLocked writes a control frame to the peer. Caller holds t.mu.
-func (t *Tunnel) sendFrameLocked(typ byte, p *Peer) {
-	t.sendLocked(typ, p, nil)
+func (t *Tunnel) sendFrameLocked(typ byte, p *Peer, payload []byte) {
+	t.sendLocked(typ, p, payload)
 }
 
 // sendLocked writes a frame to the peer — directly if we have a working
 // endpoint, or wrapped in a relay packet to the relay server (M3). Caller
 // holds t.mu.
 func (t *Tunnel) sendLocked(typ byte, p *Peer, payload []byte) {
+	// M6: encrypt data frames under the negotiated session key. Control frames
+	// (hello/helloAck/ping/pong) stay cleartext. AAD binds the peer pair.
+	if typ == frameData && p.session != nil {
+		payload = p.session.Seal(peerAAD(t.myID, p.ID), payload)
+	}
 	data, err := buildFrame(typ, t.myID, p.ID, payload)
 	if err != nil {
 		return
@@ -384,8 +540,8 @@ func (t *Tunnel) sendLocked(typ byte, p *Peer, payload []byte) {
 
 // sendFrame writes a frame to an arbitrary address (used while punching,
 // before the working address is known).
-func (t *Tunnel) sendFrame(typ byte, peerID string, addr *net.UDPAddr) {
-	data, err := buildFrame(typ, t.myID, peerID, nil)
+func (t *Tunnel) sendFrame(typ byte, peerID string, addr *net.UDPAddr, payload []byte) {
+	data, err := buildFrame(typ, t.myID, peerID, payload)
 	if err != nil {
 		return
 	}
@@ -396,8 +552,8 @@ func (t *Tunnel) sendFrame(typ byte, peerID string, addr *net.UDPAddr) {
 }
 
 // sendRelayFrame sends a hello for peerID through the relay server (M3).
-func (t *Tunnel) sendRelayFrame(typ byte, peerID string) {
-	data, err := buildFrame(typ, t.myID, peerID, nil)
+func (t *Tunnel) sendRelayFrame(typ byte, peerID string, payload []byte) {
+	data, err := buildFrame(typ, t.myID, peerID, payload)
 	if err != nil {
 		return
 	}

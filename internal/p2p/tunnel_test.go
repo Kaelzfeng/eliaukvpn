@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"eliaukvpn/internal/crypto"
 )
 
 // testPayload is a minimal valid IPv4 packet (like one read off the virtual
@@ -94,5 +96,103 @@ func TestSendDataBeforeConnect(t *testing.T) {
 	alice.BeginConnect("ffffffffffffffff", "nobody", nil)
 	if err := alice.SendData("ffffffffffffffff", testPayload); err == nil {
 		t.Fatal("SendData to connecting peer should error")
+	}
+}
+
+// sessionFor returns a peer's negotiated session, or nil.
+func (tun *Tunnel) sessionFor(t *testing.T, peerID string) *crypto.Session {
+	t.Helper()
+	tun.mu.Lock()
+	defer tun.mu.Unlock()
+	if p, ok := tun.peers[peerID]; ok {
+		return p.session
+	}
+	return nil
+}
+
+// connectPair punches alice and bob together on loopback, both with identities,
+// and waits until both are connected.
+func connectEncryptedPair(t *testing.T, alice, bob *Tunnel, aConn, bConn *net.UDPConn) {
+	t.Helper()
+	alice.BeginConnect("bbbbbbbbbbbbbbbb", "bob", []*net.UDPAddr{bConn.LocalAddr().(*net.UDPAddr)})
+	bob.BeginConnect("aaaaaaaaaaaaaaaa", "alice", []*net.UDPAddr{aConn.LocalAddr().(*net.UDPAddr)})
+	waitConnected(t, alice, "bbbbbbbbbbbbbbbb", 3*time.Second)
+	waitConnected(t, bob, "aaaaaaaaaaaaaaaa", 3*time.Second)
+}
+
+// TestEncryptedDataPlane runs the M6 handshake over the real UDP path: both
+// sides install identities, punch, negotiate a session, and then a data frame
+// crosses and is decrypted by the peer. A session being present on both sides
+// (combined with the crypto package's Seal/Open tests proving the ciphertext
+// differs from the plaintext) means the on-wire frame is AES-GCM encrypted.
+func TestEncryptedDataPlane(t *testing.T) {
+	alice, aConn := newTunnel(t, "aaaaaaaaaaaaaaaa")
+	bob, bConn := newTunnel(t, "bbbbbbbbbbbbbbbb")
+
+	aliceID, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobID, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice.SetIdentity(aliceID)
+	bob.SetIdentity(bobID)
+
+	connectEncryptedPair(t, alice, bob, aConn, bConn)
+
+	if alice.sessionFor(t, "bbbbbbbbbbbbbbbb") == nil {
+		t.Fatal("alice has no session after connecting")
+	}
+	if bob.sessionFor(t, "aaaaaaaaaaaaaaaa") == nil {
+		t.Fatal("bob has no session after connecting")
+	}
+
+	got := make(chan []byte, 1)
+	bob.SetDataSink(func(pkt []byte) { got <- append([]byte(nil), pkt...) })
+
+	if err := alice.SendData("bbbbbbbbbbbbbbbb", testPayload); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	select {
+	case pkt := <-got:
+		if string(pkt) != string(testPayload) {
+			t.Fatalf("decrypted payload mismatch: got %v want %v", pkt, testPayload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("encrypted data never arrived")
+	}
+}
+
+// TestMixedIdentityRejected verifies that a client with an identity refuses to
+// complete a handshake with a legacy (cleartext, no identity) peer — a crypto
+// downgrade must not be silent. The initiator stays connecting and eventually
+// fails; it must never report the peer as connected.
+func TestMixedIdentityRejected(t *testing.T) {
+	alice, aConn := newTunnel(t, "aaaaaaaaaaaaaaaa")
+	bob, bConn := newTunnel(t, "bbbbbbbbbbbbbbbb")
+
+	aliceID, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice.SetIdentity(aliceID) // bob stays legacy (no identity)
+
+	alice.BeginConnect("bbbbbbbbbbbbbbbb", "bob", []*net.UDPAddr{bConn.LocalAddr().(*net.UDPAddr)})
+	bob.BeginConnect("aaaaaaaaaaaaaaaa", "alice", []*net.UDPAddr{aConn.LocalAddr().(*net.UDPAddr)})
+
+	// alice must not connect to a legacy peer.
+	deadline := time.Now().Add(800 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for _, s := range alice.Snapshot() {
+			if s.ID == "bbbbbbbbbbbbbbbb" && s.State == StateConnected {
+				t.Fatal("alice connected to a legacy peer (crypto downgrade)")
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if alice.sessionFor(t, "bbbbbbbbbbbbbbbb") != nil {
+		t.Fatal("alice established a session with a legacy peer")
 	}
 }
