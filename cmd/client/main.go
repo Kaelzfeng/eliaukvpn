@@ -24,6 +24,7 @@ import (
 	"eliaukvpn/internal/p2p"
 	"eliaukvpn/internal/protocol"
 	"eliaukvpn/internal/stun"
+	"eliaukvpn/internal/vnic"
 )
 
 func main() {
@@ -39,6 +40,8 @@ func run() error {
 		stunPrimary   = flag.String("stun-primary", "stun.l.google.com:19302", "primary STUN server")
 		stunSecondary = flag.String("stun-secondary", "stun.cloudflare.com:3478", "secondary STUN server (symmetry detection)")
 		forceRelay    = flag.Bool("force-relay", false, "skip direct punching, always relay via server (testing / symmetric NAT)")
+		useVnic       = flag.Bool("vnic", true, "create and use the Wintun virtual NIC")
+		vnicName      = flag.String("vnic-name", "", "virtual NIC adapter name (default Eliauk-<name>)")
 	)
 	flag.Parse()
 	if *name == "" {
@@ -69,12 +72,62 @@ func run() error {
 	}
 
 	var (
-		mu     sync.Mutex
-		myID   string
-		tunnel *p2p.Tunnel
-		byID   = make(map[string]protocol.Peer)
-		byName = make(map[string]protocol.Peer)
+		mu        sync.Mutex
+		myID      string
+		tunnel    *p2p.Tunnel
+		adVnic    *vnic.Adapter
+		routes    = make(map[string]string) // virtual ip -> peer id (M4)
+		attempted = make(map[string]bool)   // peer ids we auto-connected to
+		byID      = make(map[string]protocol.Peer)
+		byName    = make(map[string]protocol.Peer)
 	)
+
+	// autoConnect updates the virtual-IP route table and sends a
+	// connect_request for every online peer we haven't already tried, so the
+	// virtual LAN is fully connected without manual `connect` commands.
+	autoConnect := func(peers []protocol.Peer) {
+		var fresh []protocol.Peer
+		mu.Lock()
+		for _, p := range peers {
+			if p.VirtualIP != "" {
+				routes[p.VirtualIP] = p.ID
+			}
+			// Only auto-connect to peers that have reported a punchable
+			// endpoint — otherwise the server rejects the connect_request and
+			// marking the peer attempted here would prevent a later retry.
+			if p.PublicIP != "" && !attempted[p.ID] {
+				attempted[p.ID] = true
+				fresh = append(fresh, p)
+			}
+		}
+		mu.Unlock()
+		for _, p := range fresh {
+			if err := send(conn, protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: p.ID}); err != nil {
+				log.Printf("warning: auto-connect %s: %v", p.Name, err)
+			}
+		}
+	}
+
+	// forwardFromVnic routes one IP packet read off the virtual NIC to the
+	// peer that owns its destination virtual IP. Unknown destinations and
+	// non-unicast (broadcast/multicast) are dropped here; M5 adds broadcast.
+	forwardFromVnic := func(pkt []byte) {
+		dst := ipv4Dst(pkt)
+		if dst == "" {
+			return
+		}
+		mu.Lock()
+		peerID, ok := routes[dst]
+		t := tunnel
+		mu.Unlock()
+		if !ok || t == nil {
+			return
+		}
+		if err := t.SendData(peerID, pkt); err != nil {
+			// Peer not connected yet — drop; upper-layer retries will flow
+			// once the auto-connect handshake completes.
+		}
+	}
 
 	// 3. WebSocket message loop.
 	wsErr := make(chan error, 1)
@@ -104,9 +157,50 @@ func run() error {
 				if *forceRelay {
 					tunnel.SetForceRelay(true)
 				}
+				// Decapsulated IP packets from peers go into the virtual NIC.
+				tunnel.SetDataSink(func(pkt []byte) {
+					mu.Lock()
+					a := adVnic
+					mu.Unlock()
+					if a == nil {
+						return
+					}
+					if err := a.Write(pkt); err != nil {
+						log.Printf("vnic: write: %v", err)
+					}
+				})
 				mergePeers(byID, byName, reg.Peers)
 				mu.Unlock()
+
+				if *useVnic {
+					adapterName := *vnicName
+					if adapterName == "" {
+						adapterName = "Eliauk-" + *name
+					}
+					a, err := vnic.Open(adapterName, reg.VirtualIP, "255.255.255.0")
+					if err != nil {
+						log.Printf("warning: virtual NIC unavailable: %v", err)
+					} else {
+						mu.Lock()
+						adVnic = a
+						mu.Unlock()
+						fmt.Printf("virtual NIC    : %s (%s)\n", adapterName, reg.VirtualIP)
+						go func() {
+							for {
+								pkt, err := a.Read()
+								if err != nil {
+									log.Printf("vnic: read: %v", err)
+									return
+								}
+								forwardFromVnic(pkt)
+								a.Release(pkt)
+							}
+						}()
+					}
+				}
+
 				printPeers(reg.Peers)
+				autoConnect(reg.Peers)
 				reportEndpoint(conn, probe, p2pConn)
 			case protocol.TypePeersList:
 				var list protocol.PeersList
@@ -115,6 +209,7 @@ func run() error {
 				mu.Lock()
 				mergePeers(byID, byName, list.Peers)
 				mu.Unlock()
+				autoConnect(list.Peers)
 			case protocol.TypeConnectCandidates:
 				var cc protocol.ConnectCandidates
 				_ = json.Unmarshal(env.Data, &cc)
@@ -312,6 +407,19 @@ func printPeers(peers []protocol.Peer) {
 	for _, p := range peers {
 		fmt.Printf("  - %-12s %-12s %s (%s)\n", p.Name, p.VirtualIP, endpointString(p), p.NATType)
 	}
+}
+
+// ipv4Dst returns the destination address of an IPv4 packet, or "" if the
+// packet is not a well-formed IPv4 datagram.
+func ipv4Dst(pkt []byte) string {
+	if len(pkt) < 20 || pkt[0]>>4 != 4 {
+		return ""
+	}
+	ihl := int(pkt[0]&0x0f) * 4
+	if ihl < 20 || ihl > len(pkt) {
+		return ""
+	}
+	return net.IP(pkt[ihl-4 : ihl]).String()
 }
 
 func endpointString(p protocol.Peer) string {

@@ -28,6 +28,7 @@ const (
 	frameHelloAck byte = 2 // punch confirmed
 	framePing     byte = 3 // tunnel liveness probe
 	framePong     byte = 4
+	frameData     byte = 5 // an IP packet from the virtual NIC (M4)
 )
 
 const (
@@ -71,11 +72,12 @@ type Tunnel struct {
 	conn *net.UDPConn
 	myID string // hex client id
 
-	mu         sync.Mutex
-	peers      map[string]*Peer
-	relayAddr  *net.UDPAddr // relay server endpoint (M3); nil = no relay
-	forceRelay bool         // skip direct punching entirely (testing / NAT known symmetric)
-	logf       func(format string, args ...any)
+	mu        sync.Mutex
+	peers     map[string]*Peer
+	relayAddr *net.UDPAddr // relay server endpoint (M3); nil = no relay
+	forceRelay bool        // skip direct punching entirely (testing / NAT known symmetric)
+	dataSink  func(pkt []byte) // receives IP packets decapsulated from peers (M4)
+	logf      func(format string, args ...any)
 }
 
 // New creates a tunnel on conn. myID is this client's hex id.
@@ -143,6 +145,39 @@ func (t *Tunnel) SetForceRelay(v bool) {
 	t.mu.Lock()
 	t.forceRelay = v
 	t.mu.Unlock()
+}
+
+// SetDataSink registers the callback that receives IP packets decapsulated
+// from connected peers (M4). The client writes them into the virtual NIC.
+func (t *Tunnel) SetDataSink(fn func([]byte)) {
+	t.mu.Lock()
+	t.dataSink = fn
+	t.mu.Unlock()
+}
+
+// SendData sends an IP packet to a peer over the established tunnel (direct
+// or relayed). It returns an error if the peer is unknown or not connected —
+// the caller may drop the packet (upper layers will retry).
+func (t *Tunnel) SendData(peerID string, payload []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.peers[peerID]
+	if !ok {
+		return fmt.Errorf("unknown peer %s", peerID)
+	}
+	if p.State != StateConnected {
+		return fmt.Errorf("peer %s not connected", peerID)
+	}
+	t.sendLocked(frameData, p, payload)
+	return nil
+}
+
+// HasPeer reports whether the tunnel knows about the given peer id.
+func (t *Tunnel) HasPeer(peerID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.peers[peerID]
+	return ok
 }
 
 // Announce tells the relay server the address we send from, so it can forward
@@ -285,14 +320,23 @@ func (t *Tunnel) handleFrame(f *frame, addr *net.UDPAddr) {
 	case framePong:
 		rtt := time.Since(p.lastPing)
 		t.logf("p2p: tunnel to %s RTT=%s", p.Name, rtt.Round(time.Microsecond))
+	case frameData:
+		if t.dataSink != nil {
+			t.dataSink(f.payload)
+		}
 	}
 }
 
-// sendFrameLocked writes a frame to the peer — directly if we have a working
+// sendFrameLocked writes a control frame to the peer. Caller holds t.mu.
+func (t *Tunnel) sendFrameLocked(typ byte, p *Peer) {
+	t.sendLocked(typ, p, nil)
+}
+
+// sendLocked writes a frame to the peer — directly if we have a working
 // endpoint, or wrapped in a relay packet to the relay server (M3). Caller
 // holds t.mu.
-func (t *Tunnel) sendFrameLocked(typ byte, p *Peer) {
-	data, err := buildFrame(typ, t.myID, p.ID, nil)
+func (t *Tunnel) sendLocked(typ byte, p *Peer, payload []byte) {
+	data, err := buildFrame(typ, t.myID, p.ID, payload)
 	if err != nil {
 		return
 	}
@@ -304,7 +348,9 @@ func (t *Tunnel) sendFrameLocked(typ byte, p *Peer) {
 		if err != nil {
 			return
 		}
-		t.logf("p2p: send typ=%d to=%s (relay)", typ, t.relayAddr)
+		if typ != frameData {
+			t.logf("p2p: send typ=%d to=%s (relay)", typ, t.relayAddr)
+		}
 		if _, err := t.conn.WriteToUDP(rp, t.relayAddr); err != nil {
 			t.logf("p2p: relay send: %v", err)
 		}
@@ -313,7 +359,9 @@ func (t *Tunnel) sendFrameLocked(typ byte, p *Peer) {
 	if p.Remote == nil {
 		return
 	}
-	t.logf("p2p: send typ=%d to=%s", typ, p.Remote)
+	if typ != frameData {
+		t.logf("p2p: send typ=%d to=%s", typ, p.Remote)
+	}
 	if _, err := t.conn.WriteToUDP(data, p.Remote); err != nil {
 		t.logf("p2p: send to %s: %v", p.Remote, err)
 	}
