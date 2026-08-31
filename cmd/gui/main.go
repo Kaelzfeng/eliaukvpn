@@ -28,6 +28,7 @@ import (
 	"eliaukvpn/internal/config"
 	"eliaukvpn/internal/crypto"
 	"eliaukvpn/internal/p2p"
+	"eliaukvpn/internal/protocol"
 	"eliaukvpn/internal/tray"
 	"eliaukvpn/internal/window"
 )
@@ -59,6 +60,9 @@ func run() error {
 		keyfile       = flag.String("keyfile", agent.DefaultKeyfile(), "path to the X25519 identity key")
 		noElevate     = flag.Bool("no-elevate", false, "skip the UAC elevation prompt (virtual NIC will be unavailable)")
 		exitAfter     = flag.Duration("exit-after", 0, "automation hook: quit after this long (0 = run until quit)")
+		accountFlag   = flag.String("account", "", "M7 account to log in as (automation hook; needs -password)")
+		passwordFlag  = flag.String("password", "", "password for -account")
+		createFlag    = flag.Bool("create-account", false, "register -account instead of logging in")
 	)
 	flag.Parse()
 
@@ -108,6 +112,25 @@ func run() error {
 			debugPackets:  *debugPackets,
 			keyfile:       *keyfile,
 		},
+	}
+
+	// Automation hook: log in / register an account on startup (used by the e2e
+	// script). The plaintext password lives only in a.pendingPass and is never
+	// written to the config; the fresh session token is cached after login.
+	if *accountFlag != "" {
+		if *passwordFlag != "" || *createFlag {
+			// Explicit password login / registration: clear any stale token so
+			// the server validates the password.
+			a.cfg.Account = *accountFlag
+			a.cfg.Token = ""
+			a.pendingUser = *accountFlag
+			a.pendingPass = *passwordFlag
+			a.pendingCreate = *createFlag
+		} else {
+			// No password: keep the cached session token (if any) and just point
+			// the account at the given name.
+			a.cfg.Account = *accountFlag
+		}
 	}
 
 	win, err := window.New()
@@ -228,6 +251,13 @@ type app struct {
 	noteGood bool
 	noteAt   time.Time
 
+	// M7: the login attempt currently in flight. pendingUser non-empty means the
+	// agent is trying to authenticate as that account; the password is kept only
+	// in memory (never persisted) until the server issues a session token.
+	pendingUser   string
+	pendingPass   string
+	pendingCreate bool
+
 	quitOnce sync.Once
 }
 
@@ -312,9 +342,35 @@ func (a *app) agentLoop() {
 		a.cancel = nil
 		a.mu.Unlock()
 		cancel()
+
+		// Inspect the live agent BEFORE closing it: Status() still holds the
+		// last server error, which distinguishes an auth rejection from a
+		// network drop.
+		st := ag.Status()
+		rejected := err != nil && !st.Registered && st.LastErr != ""
 		ag.Close()
 
-		if err != nil {
+		if rejected {
+			a.mu.Lock()
+			pending := a.pendingUser
+			a.mu.Unlock()
+			if pending != "" {
+				// The account/password (or register) was refused. Stop retrying
+				// and drop back to the logged-out state so the user can fix it.
+				a.setNote("登录失败："+st.LastErr, false)
+				a.mu.Lock()
+				a.pendingUser, a.pendingPass, a.pendingCreate = "", "", false
+				a.cfg.Account, a.cfg.Token = "", ""
+				a.mu.Unlock()
+			} else {
+				// A cached session token no longer works (revoked or rotated).
+				a.setNote("登录状态已失效，请重新登录", false)
+				a.mu.Lock()
+				a.cfg.Account, a.cfg.Token = "", ""
+				a.mu.Unlock()
+			}
+			_ = a.cfg.Save(a.cfgPath)
+		} else if err != nil {
 			a.setNote("连接中断，正在重连…", false)
 		}
 		select {
@@ -328,6 +384,7 @@ func (a *app) agentLoop() {
 func (a *app) agentOptions() agent.Options {
 	a.mu.Lock()
 	cfg := *a.cfg
+	pass, create := a.pendingPass, a.pendingCreate
 	a.mu.Unlock()
 
 	var keys [][]byte
@@ -348,8 +405,15 @@ func (a *app) agentOptions() agent.Options {
 		DebugPackets:  a.opts.debugPackets,
 		Keyfile:       a.opts.keyfile,
 		Friends:       keys,
-		Info:          log.Printf,
-		Logf:          log.Printf,
+		// M7 credentials. A fresh login/registration carries the plaintext
+		// password (cfg.Token is cleared so the server validates it); after a
+		// session token has been cached, later restarts authenticate with it.
+		Account:  cfg.Account,
+		Password: pass,
+		Token:    cfg.Token,
+		Create:   create,
+		Info:     log.Printf,
+		Logf:     log.Printf,
 	}
 }
 
@@ -360,6 +424,7 @@ func (a *app) tickLoop() {
 	for {
 		select {
 		case <-tick.C:
+			a.maybePersistToken()
 			a.win.SetView(a.view())
 			trTooltip(a)
 		case <-a.quitCh:
@@ -368,9 +433,42 @@ func (a *app) tickLoop() {
 	}
 }
 
+// maybePersistToken caches the session token so the next start can log in
+// without a password. The server rotates the token on every successful login,
+// so even a token-based login produces a fresh token that must be persisted (the
+// old cached one is already invalid server-side). The plaintext password is
+// never written to disk: once the server has handed out a token, the pending
+// password is forgotten.
+func (a *app) maybePersistToken() {
+	a.mu.Lock()
+	ag := a.ag
+	acct := a.cfg.Account
+	cached := a.cfg.Token
+	a.mu.Unlock()
+	if ag == nil || acct == "" {
+		return
+	}
+	if ag.Account() != acct || ag.Token() == "" {
+		return
+	}
+	fresh := ag.Token()
+	if fresh == cached {
+		return
+	}
+	a.mu.Lock()
+	a.cfg.Token = fresh
+	a.pendingUser, a.pendingPass, a.pendingCreate = "", "", false
+	a.mu.Unlock()
+	if err := a.cfg.Save(a.cfgPath); err != nil {
+		a.setNote("保存登录状态失败："+err.Error(), false)
+	}
+}
+
 // view snapshots the current agent/config state into the window's renderable
-// model. The listbox mirrors cfg.Friends one row each (row i ↔ friend i), so
-// the delete button's listbox index maps straight back to a friend.
+// model. When logged in to an M7 account the listbox mirrors the server-side
+// friend directory (row i ↔ directory[i], sorted by username); in legacy mode
+// it mirrors cfg.Friends (row i ↔ friend i). The delete button's listbox index
+// maps straight back to whichever list view() rendered.
 func (a *app) view() window.View {
 	a.mu.Lock()
 	cfg := *a.cfg
@@ -380,6 +478,17 @@ func (a *app) view() window.View {
 
 	v := window.View{Code: a.myCode, Name: cfg.Name, Server: cfg.Server}
 
+	var st agent.Status
+	acct := ""
+	if ag != nil {
+		st = ag.Status()
+		// Registered gates "logged in": myAccount is set at construction, so a
+		// rejected login would otherwise look logged-in before the server reply.
+		if st.Registered && st.Account != "" {
+			acct = st.Account
+		}
+	}
+
 	switch {
 	case note != "" && time.Since(noteAt) < 4*time.Second:
 		v.Status, v.Good = note, noteGood
@@ -388,21 +497,47 @@ func (a *app) view() window.View {
 	case ag == nil:
 		v.Status = "正在连接服务器…"
 	default:
-		st := ag.Status()
 		switch {
 		case st.VnicMsg != "":
 			v.Status = "虚拟网卡不可用：" + st.VnicMsg
 		case st.Registered:
-			v.Status = fmt.Sprintf("已连接 · %s · 虚拟IP %s", st.Name, st.VirtualIP)
+			name := st.Name
+			if name == "" && acct != "" {
+				name = acct
+			}
+			v.Status = fmt.Sprintf("已连接 · %s · 虚拟IP %s", name, st.VirtualIP)
 			v.Good = true
 		default:
 			v.Status = "连接中…"
 		}
 	}
 
+	// M7 account / room / hint lines.
+	v.Account = acct
+	v.LoggedIn = acct != ""
+	if acct != "" {
+		v.AcctState = "当前账号：" + acct + " · 已登录"
+		v.AddHint = "输入对方的用户名（账号）即可添加"
+	} else {
+		v.AcctState = "未登录"
+		v.AddHint = "未登录：可粘贴好友码连接；登录后可按用户名加好友"
+	}
+	if ag != nil {
+		if room := ag.RoomState(); room != nil {
+			v.RoomState = fmt.Sprintf("房间：%s · %d 人", room.Code, len(room.Members))
+			v.RoomIn = true
+		}
+	}
+
 	online, conn := peerState(ag)
-	for _, f := range cfg.Friends {
-		v.Rows = append(v.Rows, friendRow(f, online, conn))
+	if acct != "" {
+		for _, f := range ag.FriendDirectory() {
+			v.Rows = append(v.Rows, accountFriendRow(f, conn))
+		}
+	} else {
+		for _, f := range cfg.Friends {
+			v.Rows = append(v.Rows, friendRow(f, online, conn))
+		}
 	}
 	return v
 }
@@ -424,6 +559,22 @@ func peerState(ag *agent.Agent) (online map[string]bool, conn map[string]p2p.Sta
 		conn[k] = s.State
 	}
 	return online, conn
+}
+
+// accountFriendRow renders one M7 account-directory friend. Presence comes from
+// the server (f.Online); the tunnel state overlays a stronger claim when a P2P
+// connection is actually up or in progress.
+func accountFriendRow(f protocol.Friend, conn map[string]p2p.State) string {
+	switch conn[strings.ToLower(f.Username)] {
+	case p2p.StateConnected:
+		return f.Username + " — 已连接"
+	case p2p.StateConnecting:
+		return f.Username + " — 连接中"
+	}
+	if f.Online {
+		return f.Username + " — 在线"
+	}
+	return f.Username + " — 离线"
 }
 
 // friendRow renders one friend as a listbox line with its live state.
@@ -460,7 +611,11 @@ func trTooltip(a *app) {
 	default:
 		st := ag.Status()
 		if st.Registered {
-			a.tr.SetTooltip(fmt.Sprintf("Eliauk VPN — %s (%s)", st.Name, st.VirtualIP))
+			name := st.Name
+			if name == "" && st.Account != "" {
+				name = st.Account
+			}
+			a.tr.SetTooltip(fmt.Sprintf("Eliauk VPN — %s (%s)", name, st.VirtualIP))
 		} else {
 			a.tr.SetTooltip("Eliauk VPN — 连接中…")
 		}
@@ -474,32 +629,56 @@ func (a *app) handleEvent(ev window.EvMsg) {
 		window.CopyToClipboard(a.win.Hwnd(), a.myCode)
 		a.setNote("好友码已复制到剪贴板", true)
 	case window.EvAdd:
-		a.addFriend(ev.Text2, ev.Text)
+		a.addFriend(ev.Text)
 	case window.EvDelete:
 		a.deleteFriend(ev.Index)
 	case window.EvSave:
 		a.saveSettings(ev.Text, ev.Text2)
 	case window.EvQuit:
 		a.quit()
+	case window.EvLogin:
+		a.doAuth(ev.Text, ev.Text2, false)
+	case window.EvRegister:
+		a.doAuth(ev.Text, ev.Text2, true)
+	case window.EvLogout:
+		a.logout()
+	case window.EvRoomCreate:
+		a.roomAction(func(ag *agent.Agent) error { return ag.CreateRoom() }, "已创建房间", true)
+	case window.EvRoomJoin:
+		a.roomAction(func(ag *agent.Agent) error { return ag.JoinRoom(ev.Text) }, "已加入房间", true)
+	case window.EvRoomLeave:
+		a.roomAction(func(ag *agent.Agent) error { return ag.LeaveRoom() }, "已离开房间", true)
 	}
 }
 
-// addFriend validates and stores a friend code, then pushes it to the live
-// agent so the whitelist updates immediately.
-func (a *app) addFriend(name, code string) {
-	code = strings.TrimSpace(code)
-	name = strings.TrimSpace(name)
-	if code == "" {
-		a.setNote("请先粘贴好友的好友码", false)
-		return
-	}
-	if _, err := crypto.ParseFingerprint(code); err != nil {
-		a.setNote("好友码格式不对："+err.Error(), false)
+// addFriend adds a peer: by username when logged in to an M7 account (the
+// server resolves it and makes the friendship symmetric), or by pasted friend
+// fingerprint in legacy mode. Either way the live agent's whitelist updates.
+func (a *app) addFriend(input string) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		a.setNote("请输入对方的用户名", false)
 		return
 	}
 	a.mu.Lock()
-	added := a.cfg.AddFriend(name, code)
 	ag := a.ag
+	acct := loggedInAccount(ag)
+	a.mu.Unlock()
+	if acct != "" {
+		if err := ag.AddFriendByName(input); err != nil {
+			a.setNote(err.Error(), false)
+			return
+		}
+		a.setNote("已添加好友："+input, true)
+		return
+	}
+	// Legacy fingerprint mode (not logged in).
+	if _, err := crypto.ParseFingerprint(input); err != nil {
+		a.setNote("未登录且输入的不是有效好友码："+err.Error(), false)
+		return
+	}
+	a.mu.Lock()
+	added := a.cfg.AddFriend("", input)
 	a.mu.Unlock()
 	if !added {
 		a.setNote("这个好友码已经在列表里了", false)
@@ -510,14 +689,33 @@ func (a *app) addFriend(name, code string) {
 		return
 	}
 	if ag != nil {
-		_ = ag.AddFriend(code)
+		_ = ag.AddFriend(input)
 	}
 	a.setNote("已添加好友", true)
 }
 
-// deleteFriend removes the friend at listbox row idx from config and the live
-// agent.
+// deleteFriend removes the friend at listbox row idx. The row source matches
+// view(): the account friend directory when logged in, config friends otherwise.
 func (a *app) deleteFriend(idx int) {
+	a.mu.Lock()
+	ag := a.ag
+	acct := loggedInAccount(ag)
+	a.mu.Unlock()
+	if acct != "" {
+		if ag == nil {
+			return
+		}
+		dir := ag.FriendDirectory()
+		if idx < 0 || idx >= len(dir) {
+			return
+		}
+		if err := ag.RemoveFriendByName(dir[idx].Username); err != nil {
+			a.setNote(err.Error(), false)
+			return
+		}
+		a.setNote("已删除好友", true)
+		return
+	}
 	a.mu.Lock()
 	if idx < 0 || idx >= len(a.cfg.Friends) {
 		a.mu.Unlock()
@@ -525,7 +723,6 @@ func (a *app) deleteFriend(idx int) {
 	}
 	f := a.cfg.Friends[idx]
 	a.cfg.RemoveFriend(f.Code)
-	ag := a.ag
 	a.mu.Unlock()
 	if err := a.cfg.Save(a.cfgPath); err != nil {
 		a.setNote("保存配置失败："+err.Error(), false)
@@ -535,6 +732,71 @@ func (a *app) deleteFriend(idx int) {
 		_ = ag.RemoveFriend(f.Code)
 	}
 	a.setNote("已删除好友", true)
+}
+
+// loggedInAccount returns the authenticated username of ag, or "" when the
+// agent is not connected or the account is still pending.
+func loggedInAccount(ag *agent.Agent) string {
+	if ag == nil {
+		return ""
+	}
+	st := ag.Status()
+	if st.Registered && st.Account != "" {
+		return st.Account
+	}
+	return ""
+}
+
+// doAuth logs in (create=false) or registers (create=true) an account. It sets
+// the pending credentials, clears any stale session token, and rebuilds the
+// agent so it re-registers with the server.
+func (a *app) doAuth(user, pass string, create bool) {
+	user = strings.TrimSpace(user)
+	if user == "" || pass == "" {
+		a.setNote("账号和密码都不能为空", false)
+		return
+	}
+	a.mu.Lock()
+	a.pendingUser, a.pendingPass, a.pendingCreate = user, pass, create
+	a.cfg.Account = user
+	a.cfg.Token = "" // force a password-based (re)authentication
+	a.mu.Unlock()
+	a.signalRestart()
+	if create {
+		a.setNote("正在注册…", true)
+	} else {
+		a.setNote("正在登录…", true)
+	}
+}
+
+// logout clears the cached account/token and reconnects anonymously.
+func (a *app) logout() {
+	a.mu.Lock()
+	a.pendingUser, a.pendingPass, a.pendingCreate = "", "", false
+	a.cfg.Account, a.cfg.Token = "", ""
+	a.mu.Unlock()
+	if err := a.cfg.Save(a.cfgPath); err != nil {
+		a.setNote("保存配置失败："+err.Error(), false)
+		return
+	}
+	a.signalRestart()
+	a.setNote("已退出登录", true)
+}
+
+// roomAction runs one room operation on the live agent and reports the result.
+func (a *app) roomAction(fn func(*agent.Agent) error, okNote string, good bool) {
+	a.mu.Lock()
+	ag := a.ag
+	a.mu.Unlock()
+	if ag == nil {
+		a.setNote("尚未连接服务器", false)
+		return
+	}
+	if err := fn(ag); err != nil {
+		a.setNote(err.Error(), false)
+		return
+	}
+	a.setNote(okNote, good)
 }
 
 // saveSettings persists the nickname/server and restarts the agent with them.

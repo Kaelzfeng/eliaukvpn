@@ -20,11 +20,14 @@ func TestLoadMissingFileIsFresh(t *testing.T) {
 func TestSaveLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sub", "config.json")
 	c := &Config{
-		Name:   "Alice",
-		Server: "ws://vps.example.com:9090/ws",
+		Name:    "Alice",
+		Server:  "ws://vps.example.com:9090/ws",
+		Account: "alice",
+		Token:   "cafebabe",
 		Friends: []Friend{
 			{Name: "Bob", Code: "AAAA=="},
 			{Name: "", Code: "BBBB=="},
+			{Name: "", User: "carol"},
 		},
 	}
 	if err := c.Save(path); err != nil {
@@ -37,7 +40,10 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if got.Name != "Alice" || got.Server != "ws://vps.example.com:9090/ws" {
 		t.Fatalf("round-trip name/server mismatch: %+v", got)
 	}
-	if len(got.Friends) != 2 || got.Friends[0].Code != "AAAA==" || got.Friends[1].Name != "" {
+	if got.Account != "alice" || got.Token != "cafebabe" {
+		t.Fatalf("round-trip account/token mismatch: %+v", got)
+	}
+	if len(got.Friends) != 3 || got.Friends[0].Code != "AAAA==" || got.Friends[1].Name != "" || got.Friends[2].User != "carol" {
 		t.Fatalf("round-trip friends mismatch: %+v", got.Friends)
 	}
 }
@@ -82,6 +88,37 @@ func TestAddRemoveFriend(t *testing.T) {
 		t.Fatalf("expected 0 friends after remove, got %d", len(c.Friends))
 	}
 	if c.RemoveFriend("AAAA==") {
+		t.Fatal("second remove should fail")
+	}
+}
+
+func TestAddRemoveFriendUser(t *testing.T) {
+	c := &Config{}
+	if !c.AddFriendUser("  carol  ") {
+		t.Fatal("first user add should succeed")
+	}
+	if c.AddFriendUser("carol") {
+		t.Fatal("duplicate user should not be added")
+	}
+	if c.AddFriendUser("   ") {
+		t.Fatal("blank user should not be added")
+	}
+	if len(c.Friends) != 1 || c.Friends[0].User != "carol" {
+		t.Fatalf("expected one user friend, got %+v", c.Friends)
+	}
+	if !c.HasFriendUser("carol") {
+		t.Fatal("HasFriendUser should find carol")
+	}
+	if c.HasFriendUser("dave") {
+		t.Fatal("HasFriendUser should not find dave")
+	}
+	if !c.RemoveFriendUser("carol") {
+		t.Fatal("remove user should succeed")
+	}
+	if len(c.Friends) != 0 {
+		t.Fatalf("expected 0 friends after remove, got %d", len(c.Friends))
+	}
+	if c.RemoveFriendUser("carol") {
 		t.Fatal("second remove should fail")
 	}
 }

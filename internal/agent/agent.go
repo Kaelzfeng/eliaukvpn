@@ -7,6 +7,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +49,17 @@ type Options struct {
 	// GUI (which manages friends in its config) instead of a friends file.
 	// If FriendsFile is set it takes precedence.
 	Friends [][]byte
+	// M7 account login. When Account is set the agent registers an account
+	// client: it sends the username plus either a password (first login or
+	// account creation) or a cached session token (Password empty), and binds
+	// its X25519 fingerprint to the account. Create=true registers a brand-new
+	// account. An empty Account keeps the legacy anonymous mode. The fresh
+	// session token comes back in Registered.Token and should be cached so the
+	// next start needs no password.
+	Account  string
+	Password string
+	Token    string
+	Create   bool
 	// Info prints user-facing progress lines (identity, registration,
 	// endpoints). Logf prints warnings and diagnostics.
 	Info func(format string, args ...any)
@@ -67,6 +80,11 @@ type Status struct {
 	// process was not elevated, the Wintun driver is missing, etc.). The GUI
 	// shows it prominently instead of silently continuing without a NIC.
 	VnicMsg string
+	// M7: the logged-in account username ("" for legacy anonymous clients),
+	// the last server error (auth failures, etc.) and the room code if in one.
+	Account string
+	LastErr string
+	Room    string
 }
 
 // Agent is one running client core.
@@ -85,13 +103,32 @@ type Agent struct {
 	byName    map[string]protocol.Peer
 
 	identity *crypto.Identity
+	// friends is the *effective* tunnel whitelist, recomputed as the union of
+	// baseFP (legacy config friends), the M7 account friend directory (byUser)
+	// and the current room members (roomFP).
 	friends  [][]byte
+	baseFP   [][]byte // legacy config friends (from Options / friends file)
+	roomFP   [][]byte // fingerprints of the room members (M7b)
 	probe    *stun.Result
 	p2pConn  *net.UDPConn
+
+	// M7 account state.
+	myAccount string                     // my username ("" = legacy)
+	myToken   string                     // fresh session token from the server
+	myKeyFP   string                     // fingerprint the server bound to my account
+	byUser    map[string]protocol.Friend // account friend directory (username -> friend)
+	room      *RoomState                 // current room, nil when not in one
+	errNote   string                     // last server error, cleared on registration
 
 	vnicErr string
 
 	wsErr chan error
+}
+
+// RoomState is the agent's view of the room it is in (nil when not in one).
+type RoomState struct {
+	Code    string
+	Members []protocol.RoomMember
 }
 
 // New loads identity and friends, opens the P2P socket, runs the STUN probe,
@@ -167,13 +204,26 @@ func New(opts Options) (*Agent, error) {
 	opts.Info("public endpoint : %s", probeString(probe))
 	opts.Info("NAT type        : %s", probe.NAT)
 
-	// 2. Register with the coordination server.
+	// 2. Register with the coordination server. M7 account clients authenticate
+	//    with a username plus a password (first login / creation) or a cached
+	//    session token, and bind their identity fingerprint to the account.
 	conn, _, err := websocket.DefaultDialer.Dial(opts.Server, nil)
 	if err != nil {
 		p2pConn.Close()
 		return nil, fmt.Errorf("connect to server: %w", err)
 	}
-	if err := send(conn, protocol.TypeRegister, protocol.RegisterRequest{Name: opts.Name}); err != nil {
+	regReq := protocol.RegisterRequest{
+		Name:      opts.Name,
+		PublicKey: identity.Fingerprint(),
+		Account:   opts.Account,
+		Password:  opts.Password,
+		Token:     opts.Token,
+		Create:    opts.Create,
+	}
+	if regReq.Name == "" {
+		regReq.Name = regReq.Account
+	}
+	if err := send(conn, protocol.TypeRegister, regReq); err != nil {
 		p2pConn.Close()
 		conn.Close()
 		return nil, fmt.Errorf("register: %w", err)
@@ -183,9 +233,13 @@ func New(opts Options) (*Agent, error) {
 		opts:      opts,
 		conn:      conn,
 		p2pConn:   p2pConn,
-		identity:  identity,
-		friends:   friends,
-		probe:     probe,
+		identity:   identity,
+		friends:    friends,
+		baseFP:     friends,
+		myAccount:  opts.Account,
+		myToken:    opts.Token,
+		byUser:     make(map[string]protocol.Friend),
+		probe:      probe,
 		routes:    make(map[string]string),
 		attempted: make(map[string]bool),
 		byID:      make(map[string]protocol.Peer),
@@ -225,12 +279,17 @@ func (a *Agent) Status() Status {
 		Identity:   a.identity.Fingerprint(),
 		FriendCt:   len(a.friends),
 		Registered: a.myID != "",
+		Account:    a.myAccount,
+		LastErr:    a.errNote,
 	}
 	if a.probe != nil {
 		st.NAT = string(a.probe.NAT)
 		if a.probe.Mapped.IP != nil {
 			st.Public = fmt.Sprintf("%s:%d", a.probe.Mapped.IP, a.probe.Mapped.Port)
 		}
+	}
+	if a.room != nil {
+		st.Room = a.room.Code
 	}
 	st.VnicMsg = a.vnicErr
 	return st
@@ -284,10 +343,10 @@ func (a *Agent) Friends() []string {
 	return out
 }
 
-// AddFriend validates and appends a fingerprint to the allowlist, then
-// re-syncs the tunnel's whitelist immediately (M6b). It is idempotent: adding
-// an existing friend is a no-op. Safe to call before registration — the tunnel
-// picks the updated list up when it is created.
+// AddFriend validates and appends a fingerprint to the legacy config allowlist
+// (baseFP), then re-syncs the tunnel's whitelist immediately (M6b). It is
+// idempotent: adding an existing friend is a no-op. Safe to call before
+// registration — the tunnel picks the updated list up when it is created.
 func (a *Agent) AddFriend(fp string) error {
 	raw, err := crypto.ParseFingerprint(fp)
 	if err != nil {
@@ -295,23 +354,22 @@ func (a *Agent) AddFriend(fp string) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	want := base64.StdEncoding.EncodeToString(raw)
-	for _, k := range a.friends {
-		if base64.StdEncoding.EncodeToString(k) == want {
+	for _, k := range a.baseFP {
+		if bytes.Equal(k, raw) {
 			return nil // already a friend
 		}
 	}
-	a.friends = append(a.friends, raw)
-	a.syncFriendsLocked()
+	a.baseFP = append(a.baseFP, raw)
+	a.syncWhitelistLocked()
 	if a.opts.Info != nil {
 		a.opts.Info("friends         : %d allowed", len(a.friends))
 	}
 	return nil
 }
 
-// RemoveFriend deletes a fingerprint from the allowlist and re-syncs the
-// tunnel. An already-established session is not torn down (the whitelist is
-// enforced at handshake time); future connections are refused.
+// RemoveFriend deletes a fingerprint from the legacy config allowlist and
+// re-syncs the tunnel. An already-established session is not torn down (the
+// whitelist is enforced at handshake time); future connections are refused.
 func (a *Agent) RemoveFriend(fp string) error {
 	raw, err := crypto.ParseFingerprint(fp)
 	if err != nil {
@@ -319,11 +377,10 @@ func (a *Agent) RemoveFriend(fp string) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	want := base64.StdEncoding.EncodeToString(raw)
-	for i, k := range a.friends {
-		if base64.StdEncoding.EncodeToString(k) == want {
-			a.friends = append(a.friends[:i], a.friends[i+1:]...)
-			a.syncFriendsLocked()
+	for i, k := range a.baseFP {
+		if bytes.Equal(k, raw) {
+			a.baseFP = append(a.baseFP[:i], a.baseFP[i+1:]...)
+			a.syncWhitelistLocked()
 			if a.opts.Info != nil {
 				a.opts.Info("friends         : %d allowed", len(a.friends))
 			}
@@ -333,12 +390,223 @@ func (a *Agent) RemoveFriend(fp string) error {
 	return fmt.Errorf("friend not in list")
 }
 
-// syncFriendsLocked pushes the current allowlist to the tunnel. The tunnel
-// only exists after registration, so callers must hold a.mu.
-func (a *Agent) syncFriendsLocked() {
+// syncWhitelistLocked rebuilds the effective tunnel whitelist as the union of
+// the legacy config friends (baseFP), the M7 account friend directory (byUser)
+// and the current room members (roomFP), then pushes it to the tunnel. Callers
+// hold a.mu; the tunnel only exists after registration.
+func (a *Agent) syncWhitelistLocked() {
+	a.friends = dedupFP(append(append(append([][]byte(nil), a.baseFP...), a.directoryFPsLocked()...), a.roomFP...))
 	if a.tunnel != nil {
 		a.tunnel.SetFriends(a.friends)
 	}
+}
+
+// directoryFPsLocked returns the fingerprints of every friend in the M7
+// account directory (empty KeyFP entries — friends who never logged in with an
+// identity — are skipped). Callers hold a.mu.
+func (a *Agent) directoryFPsLocked() [][]byte {
+	var out [][]byte
+	for _, f := range a.byUser {
+		if raw, err := crypto.ParseFingerprint(f.KeyFP); err == nil {
+			out = append(out, raw)
+		}
+	}
+	return out
+}
+
+// dedupFP concatenates fingerprint byte-slices, deduplicating by base64 so a
+// fingerprint that is both a friend and a room member appears once.
+func dedupFP(lists ...[][]byte) [][]byte {
+	var out [][]byte
+	seen := make(map[string]bool)
+	for _, list := range lists {
+		for _, k := range list {
+			key := base64.StdEncoding.EncodeToString(k)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// ---- M7 account directory & rooms ----
+
+// Account returns the logged-in username ("" for legacy anonymous clients).
+func (a *Agent) Account() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.myAccount
+}
+
+// Token returns the session token from the last successful registration. Cache
+// it so the next start can log in without a password.
+func (a *Agent) Token() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.myToken
+}
+
+// FriendDirectory returns the account friend directory with presence, sorted
+// by username. Empty for legacy anonymous clients.
+func (a *Agent) FriendDirectory() []protocol.Friend {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]protocol.Friend, 0, len(a.byUser))
+	for _, f := range a.byUser {
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
+	return out
+}
+
+// AddFriendByName asks the server to add a friend by username (symmetric on
+// the server). The friend directory refresh arrives asynchronously.
+func (a *Agent) AddFriendByName(username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return fmt.Errorf("用户名不能为空")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.myAccount == "" {
+		return fmt.Errorf("请先登录账号")
+	}
+	return send(a.conn, protocol.TypeFriendAdd, protocol.FriendAdd{Username: username})
+}
+
+// RemoveFriendByName asks the server to drop a friend by username (symmetric).
+func (a *Agent) RemoveFriendByName(username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return fmt.Errorf("用户名不能为空")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.myAccount == "" {
+		return fmt.Errorf("请先登录账号")
+	}
+	return send(a.conn, protocol.TypeFriendRemove, protocol.FriendRemove{Username: username})
+}
+
+// RoomState returns the current room (nil when not in one). A copy is returned
+// so callers can hold it without the agent lock.
+func (a *Agent) RoomState() *RoomState {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.room == nil {
+		return nil
+	}
+	r := *a.room
+	r.Members = append([]protocol.RoomMember(nil), a.room.Members...)
+	return &r
+}
+
+// CreateRoom asks the server for a new room and joins it. The room code and
+// member list arrive asynchronously (room_created + room_joined).
+func (a *Agent) CreateRoom() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.myAccount == "" {
+		return fmt.Errorf("请先登录账号")
+	}
+	return send(a.conn, protocol.TypeRoomCreate, struct{}{})
+}
+
+// JoinRoom asks the server to add us to the room with the given code.
+func (a *Agent) JoinRoom(code string) error {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if code == "" {
+		return fmt.Errorf("房间码不能为空")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.myAccount == "" {
+		return fmt.Errorf("请先登录账号")
+	}
+	return send(a.conn, protocol.TypeRoomJoin, protocol.RoomJoin{Code: code})
+}
+
+// LeaveRoom asks the server to remove us from the current room.
+func (a *Agent) LeaveRoom() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.myAccount == "" {
+		return fmt.Errorf("请先登录账号")
+	}
+	return send(a.conn, protocol.TypeRoomLeave, struct{}{})
+}
+
+// setFriendDirectory replaces the whole account friend directory (full refresh
+// after registration, a friend add/remove) and re-syncs the whitelist.
+func (a *Agent) setFriendDirectory(friends []protocol.Friend) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.byUser = make(map[string]protocol.Friend, len(friends))
+	for _, f := range friends {
+		a.byUser[f.Username] = f
+	}
+	a.syncWhitelistLocked()
+}
+
+// upsertFriend merges one resolved friend into the directory (the server sends
+// friend_add_ok right before a full friend_list refresh, so the UI updates
+// immediately).
+func (a *Agent) upsertFriend(f protocol.Friend) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if f.Username == "" {
+		return
+	}
+	a.byUser[f.Username] = f
+	a.syncWhitelistLocked()
+}
+
+// setFriendPresence updates one friend's online flag.
+func (a *Agent) setFriendPresence(user string, online bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if f, ok := a.byUser[user]; ok {
+		f.Online = online
+		a.byUser[user] = f
+	}
+}
+
+// setRoom installs the current room and whitelists its members (excluding us).
+func (a *Agent) setRoom(rj *protocol.RoomJoined) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.room = &RoomState{Code: rj.Code, Members: rj.Members}
+	a.roomFP = memberFPs(a.myAccount, rj.Members)
+	a.syncWhitelistLocked()
+}
+
+// updateRoomMembers refreshes the member list of the current room.
+func (a *Agent) updateRoomMembers(members []protocol.RoomMember) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.room == nil {
+		return
+	}
+	a.room.Members = members
+	a.roomFP = memberFPs(a.myAccount, members)
+	a.syncWhitelistLocked()
+}
+
+// memberFPs extracts the fingerprints of every member except self.
+func memberFPs(self string, members []protocol.RoomMember) [][]byte {
+	var out [][]byte
+	for _, m := range members {
+		if m.Username == self {
+			continue
+		}
+		if raw, err := crypto.ParseFingerprint(m.KeyFP); err == nil {
+			out = append(out, raw)
+		}
+	}
+	return out
 }
 
 // messageLoop consumes server messages and drives the tunnel, virtual NIC,
@@ -367,9 +635,34 @@ func (a *Agent) messageLoop() {
 			if t != nil {
 				t.BeginConnect(cc.PeerID, cc.PeerName, toUDPAddrs(cc.Candidates))
 			}
+		case protocol.TypeFriendList:
+			var fl protocol.FriendList
+			_ = json.Unmarshal(env.Data, &fl)
+			a.setFriendDirectory(fl.Friends)
+		case protocol.TypeFriendAddOk:
+			var ok protocol.FriendAddOk
+			_ = json.Unmarshal(env.Data, &ok)
+			a.upsertFriend(ok.Friend)
+		case protocol.TypePresence:
+			var p protocol.Presence
+			_ = json.Unmarshal(env.Data, &p)
+			a.setFriendPresence(p.Username, p.Online)
+		case protocol.TypeRoomCreated:
+			// The server follows room_created with a room_joined for the creator.
+		case protocol.TypeRoomJoined:
+			var rj protocol.RoomJoined
+			_ = json.Unmarshal(env.Data, &rj)
+			a.setRoom(&rj)
+		case protocol.TypeRoomUpdate:
+			var ru protocol.RoomUpdate
+			_ = json.Unmarshal(env.Data, &ru)
+			a.updateRoomMembers(ru.Members)
 		case protocol.TypeError:
 			var e protocol.Error
 			_ = json.Unmarshal(env.Data, &e)
+			a.mu.Lock()
+			a.errNote = e.Message
+			a.mu.Unlock()
 			a.opts.Info("server error    : %s", e.Message)
 		}
 	}
@@ -385,6 +678,24 @@ func (a *Agent) onRegistered(env protocol.Envelope) {
 	a.mu.Lock()
 	a.myID = reg.ClientID
 	a.myVIP = reg.VirtualIP
+	a.errNote = ""
+	if reg.Account != "" {
+		// M7: bind the account, cache the fresh session token (so the next
+		// start needs no password) and load the friend directory with presence.
+		a.myAccount = reg.Account
+		a.myToken = reg.Token
+		a.myKeyFP = reg.KeyFP
+		a.byUser = make(map[string]protocol.Friend, len(reg.Friends))
+		for _, f := range reg.Friends {
+			a.byUser[f.Username] = f
+		}
+		if reg.Room != "" {
+			a.room = &RoomState{Code: reg.Room}
+		}
+		// Recompute the whitelist so the directory and any room members are
+		// present before the tunnel is created below.
+		a.syncWhitelistLocked()
+	}
 	a.opts.Info("registered      : id=%s virtual_ip=%s", reg.ClientID, reg.VirtualIP)
 
 	tunnel := p2p.New(a.p2pConn, a.myID, a.opts.Logf)

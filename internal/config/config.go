@@ -14,11 +14,13 @@ import (
 	"strings"
 )
 
-// Friend is one allowlisted peer: an optional display name and the base64
-// fingerprint (their X25519 public key) the user pasted into the GUI.
+// Friend is one allowlisted peer. A legacy friend is identified by the base64
+// fingerprint (their X25519 public key) pasted into the GUI; an M7 account
+// friend is identified by username and the server resolves it to a fingerprint.
 type Friend struct {
 	Name string `json:"name,omitempty"`
-	Code string `json:"code"` // base64 fingerprint (crypto.Fingerprint format)
+	User string `json:"user,omitempty"` // M7 account username (optional)
+	Code string `json:"code"`           // base64 fingerprint (crypto.Fingerprint format)
 }
 
 // Config is the whole GUI settings file.
@@ -26,6 +28,12 @@ type Config struct {
 	Name    string   `json:"name"`
 	Server  string   `json:"server,omitempty"` // ws://host:port/ws
 	Friends []Friend `json:"friends,omitempty"`
+
+	// M7 account login. Once the server has issued a session token it is cached
+	// here so the next start needs no password. The plaintext password is never
+	// persisted.
+	Account string `json:"account,omitempty"`
+	Token   string `json:"token,omitempty"`
 }
 
 // DefaultPath returns the per-user config path. On Windows this is
@@ -99,6 +107,42 @@ func (c *Config) RemoveFriend(code string) bool {
 	code = strings.TrimSpace(code)
 	for i, f := range c.Friends {
 		if f.Code == code {
+			c.Friends = append(c.Friends[:i], c.Friends[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// HasFriendUser reports whether an account friend is already in the list.
+func (c *Config) HasFriendUser(user string) bool {
+	user = strings.TrimSpace(user)
+	for _, f := range c.Friends {
+		if f.User == user {
+			return true
+		}
+	}
+	return false
+}
+
+// AddFriendUser appends an M7 account friend (deduplicated by username). The
+// server is authoritative for the friend graph; the config copy only serves the
+// pre-account and offline displays.
+func (c *Config) AddFriendUser(user string) bool {
+	user = strings.TrimSpace(user)
+	if user == "" || c.HasFriendUser(user) {
+		return false
+	}
+	c.Friends = append(c.Friends, Friend{User: user})
+	return true
+}
+
+// RemoveFriendUser deletes an account friend by username. It returns false if
+// the user was not in the list.
+func (c *Config) RemoveFriendUser(user string) bool {
+	user = strings.TrimSpace(user)
+	for i, f := range c.Friends {
+		if f.User == user {
 			c.Friends = append(c.Friends[:i], c.Friends[i+1:]...)
 			return true
 		}

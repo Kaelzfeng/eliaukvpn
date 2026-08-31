@@ -26,7 +26,7 @@ import (
 const (
 	// Client-area size in pixels (fixed, non-resizable).
 	winW = 520
-	winH = 566
+	winH = 700
 	// WS_OVERLAPPEDWINDOW (0x00CF0000) minus WS_THICKFRAME/WS_MAXIMIZEBOX.
 	winStyle = 0x00CA0000
 )
@@ -60,6 +60,7 @@ const (
 
 	esAutoHScroll = 0x0080
 	esReadOnly    = 0x0800
+	esPassword    = 0x0020 // EDIT hides the typed characters
 	bsGroupBox    = 0x0007
 	bsPushButton  = 0x0000
 	lbsNotify     = 0x0001
@@ -85,26 +86,39 @@ const (
 
 // Control IDs.
 const (
-	idcStatus = 100
-	idcCode   = 101
-	idcCopy   = 102
-	idcName2  = 103
-	idcCode2  = 104
-	idcAdd    = 105
-	idcList   = 106
-	idcDelete = 107
-	idcName   = 108
-	idcServer = 109
-	idcSave   = 110
-	idcQuit   = 111
+	idcStatus       = 100
+	idcCode         = 101 // my friend code (read-only)
+	idcCopy         = 102
+	idcName2        = 103 // (legacy nickname, unused in M7)
+	idcCode2        = 104 // add-friend input: username (account) or fingerprint (legacy)
+	idcAdd          = 105
+	idcList         = 106
+	idcDelete       = 107
+	idcName         = 108
+	idcServer       = 109
+	idcSave         = 110
+	idcQuit         = 111
+	// M7 account + room controls.
+	idcAccount   = 112 // username
+	idcPass      = 113 // password (masked)
+	idcLogin     = 114
+	idcRegister  = 115
+	idcLogout    = 116
+	idcAcctState = 117 // "当前账号：host · 已登录" / "未登录"
+	idcAddHint   = 118 // add-friend hint (changes with login state)
+	idcRoomCreate = 119
+	idcRoomCode   = 120 // room code input
+	idcRoomJoin   = 121
+	idcRoomLeave  = 122
+	idcRoomState  = 123 // "房间：ABC · 2 人" / "未加入房间"
 )
 
 // EvType is a user action emitted by the window.
 type EvType int
 
 const (
-	// EvAdd: user clicked 添加 — Text is the pasted friend code, Text2 the
-	// optional nickname.
+	// EvAdd: user clicked 添加 — Text is the input: an account username (M7) or a
+	// pasted friend fingerprint (legacy). Text2 is unused in M7.
 	EvAdd EvType = iota
 	// EvCopy: user clicked 复制 (copy my friend code to the clipboard).
 	EvCopy
@@ -114,6 +128,16 @@ const (
 	EvSave
 	// EvQuit: user clicked 退出.
 	EvQuit
+	// EvLogin: user clicked 登录 — Text is the username, Text2 the password.
+	EvLogin
+	// EvRegister: user clicked 注册 — Text is the username, Text2 the password.
+	EvRegister
+	// EvLogout: user clicked 退出登录.
+	EvLogout
+	// EvRoomCreate / EvRoomJoin (Text = room code) / EvRoomLeave: room actions.
+	EvRoomCreate
+	EvRoomJoin
+	EvRoomLeave
 )
 
 // EvMsg is one user action with its payload.
@@ -131,6 +155,15 @@ type View struct {
 	Good   bool   // status shown green (good) or red (warning)
 	Code   string // my friend code (base64 fingerprint)
 	Rows   []string
+
+	// M7 account / room / hint lines.
+	Account     string // logged-in username ("" = not logged in)
+	AcctState   string // "当前账号：host · 已登录" / "未登录"
+	AddHint     string // add-friend hint (username vs fingerprint)
+	RoomState   string // "房间：ABC · 2 人" / "未加入房间"
+	RoomIn      bool   // whether the room controls show the "join" or "leave" state
+	LoggedIn    bool   // account controls show the "logged in" state
+
 	Name   string // settings: display name
 	Server string // settings: server address
 }
@@ -149,8 +182,11 @@ type Window struct {
 	sf   uintptr // bold status font
 
 	// child controls
-	statusTxt, codeEdit, name2Edit, code2Edit, listBox                 uintptr
-	copyBtn, addBtn, deleteBtn, nameEdit, serverEdit, saveBtn, quitBtn uintptr
+	statusTxt, codeEdit, code2Edit, listBox                                   uintptr
+	copyBtn, addBtn, deleteBtn, nameEdit, serverEdit, saveBtn, quitBtn         uintptr
+	acctEdit, passEdit, loginBtn, registerBtn, logoutBtn, acctStateTxt         uintptr
+	addHintTxt, roomCreateBtn, roomCodeEdit, roomJoinBtn, roomLeaveBtn         uintptr
+	roomStateTxt                                                               uintptr
 
 	mu         sync.Mutex
 	pending    View
@@ -337,7 +373,7 @@ func (w *Window) onCommand(wParam uintptr) uintptr {
 	case idcCopy:
 		w.emit(EvMsg{Type: EvCopy})
 	case idcAdd:
-		w.emit(EvMsg{Type: EvAdd, Text: w.getText(w.code2Edit), Text2: w.getText(w.name2Edit)})
+		w.emit(EvMsg{Type: EvAdd, Text: w.getText(w.code2Edit)})
 	case idcDelete:
 		idx, _, _ := procSendMessageW.Call(w.listBox, lbGetCursel, 0, 0)
 		if int32(idx) >= 0 {
@@ -347,6 +383,21 @@ func (w *Window) onCommand(wParam uintptr) uintptr {
 		w.emit(EvMsg{Type: EvSave, Text: w.getText(w.nameEdit), Text2: w.getText(w.serverEdit)})
 	case idcQuit:
 		w.emit(EvMsg{Type: EvQuit})
+	case idcLogin:
+		w.emit(EvMsg{Type: EvLogin, Text: w.getText(w.acctEdit), Text2: w.getText(w.passEdit)})
+		setText(w.passEdit, "") // don't leave the password sitting in the control
+	case idcRegister:
+		w.emit(EvMsg{Type: EvRegister, Text: w.getText(w.acctEdit), Text2: w.getText(w.passEdit)})
+		setText(w.passEdit, "")
+	case idcLogout:
+		w.emit(EvMsg{Type: EvLogout})
+	case idcRoomCreate:
+		w.emit(EvMsg{Type: EvRoomCreate})
+	case idcRoomJoin:
+		w.emit(EvMsg{Type: EvRoomJoin, Text: w.getText(w.roomCodeEdit)})
+		setText(w.roomCodeEdit, "")
+	case idcRoomLeave:
+		w.emit(EvMsg{Type: EvRoomLeave})
 	}
 	return 0
 }
@@ -364,6 +415,26 @@ func (w *Window) applyView(v View) {
 	setText(w.codeEdit, v.Code)
 	setText(w.nameEdit, v.Name)
 	setText(w.serverEdit, v.Server)
+
+	// M7 account/room state lines and hints.
+	setText(w.acctStateTxt, v.AcctState)
+	setText(w.addHintTxt, v.AddHint)
+	setText(w.roomStateTxt, v.RoomState)
+
+	// The account/password edits are only meaningful before login; after that
+	// they collapse into a read-only "已登录" line plus the logout button.
+	setVisible(w.acctEdit, !v.LoggedIn)
+	setVisible(w.passEdit, !v.LoggedIn)
+	setVisible(w.loginBtn, !v.LoggedIn)
+	setVisible(w.registerBtn, !v.LoggedIn)
+	setVisible(w.logoutBtn, v.LoggedIn)
+
+	// Room controls: "创建/加入" before joining, "离开" after.
+	setVisible(w.roomCreateBtn, !v.RoomIn)
+	setVisible(w.roomCodeEdit, !v.RoomIn)
+	setVisible(w.roomJoinBtn, !v.RoomIn)
+	setVisible(w.roomLeaveBtn, v.RoomIn)
+
 	procSendMessageW.Call(w.listBox, lbResetContent, 0, 0)
 	for _, row := range v.Rows {
 		p, _ := syscall.UTF16PtrFromString(row)
@@ -376,6 +447,17 @@ func (w *Window) applyView(v View) {
 	if changed {
 		procInvalidateRect.Call(w.statusTxt, 0, 1)
 	}
+}
+
+func setVisible(h uintptr, visible bool) {
+	if h == 0 {
+		return
+	}
+	cmd := uintptr(swShow)
+	if !visible {
+		cmd = uintptr(swHide)
+	}
+	procShowWindow.Call(h, cmd)
 }
 
 func setText(h uintptr, s string) {
@@ -409,28 +491,46 @@ func (w *Window) create(cls, text string, style uintptr, x, y, wd, ht int32, id 
 
 func (w *Window) createControls() {
 	w.statusTxt = w.create("STATIC", "Eliauk VPN", 0, 12, 10, 496, 24, idcStatus)
-	w.create("BUTTON", "你的好友码", bsGroupBox, 8, 36, 504, 62, 0)
-	w.codeEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|esReadOnly|wsTabStop, 16, 52, 408, 22, idcCode)
-	w.copyBtn = w.create("BUTTON", "复制", bsPushButton|wsTabStop, 432, 50, 68, 26, idcCopy)
 
-	w.create("BUTTON", "添加好友", bsGroupBox, 8, 102, 504, 76, 0)
-	w.name2Edit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 16, 118, 92, 22, idcName2)
-	w.code2Edit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 116, 118, 262, 22, idcCode2)
-	w.addBtn = w.create("BUTTON", "添加", bsPushButton|wsTabStop, 386, 118, 62, 24, idcAdd)
-	w.create("STATIC", "提示：把上面你的好友码发给朋友，对方粘贴到这里即可互相连接。", 0, 16, 148, 488, 18, 0)
+	w.create("BUTTON", "账号", bsGroupBox, 8, 36, 504, 82, 0)
+	w.create("STATIC", "账号", 0, 16, 52, 40, 20, 0)
+	w.acctEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 58, 50, 140, 22, idcAccount)
+	w.create("STATIC", "密码", 0, 206, 52, 40, 20, 0)
+	w.passEdit = w.create("EDIT", "", wsBorder|esPassword|wsTabStop, 248, 50, 128, 22, idcPass)
+	w.loginBtn = w.create("BUTTON", "登录", bsPushButton|wsTabStop, 384, 48, 56, 26, idcLogin)
+	w.registerBtn = w.create("BUTTON", "注册", bsPushButton|wsTabStop, 444, 48, 60, 26, idcRegister)
+	w.acctStateTxt = w.create("STATIC", "未登录", 0, 16, 86, 330, 18, idcAcctState)
+	w.logoutBtn = w.create("BUTTON", "退出登录", bsPushButton|wsTabStop, 384, 84, 120, 24, idcLogout)
 
-	w.create("BUTTON", "连接状态", bsGroupBox, 8, 182, 504, 200, 0)
-	w.listBox = w.create("LISTBOX", "", wsBorder|wsVScroll|lbsNotify, 16, 200, 488, 174, idcList)
-	w.deleteBtn = w.create("BUTTON", "删除选中好友", bsPushButton|wsTabStop, 16, 388, 120, 26, idcDelete)
+	w.create("BUTTON", "好友", bsGroupBox, 8, 122, 504, 100, 0)
+	w.create("STATIC", "我的好友码", 0, 16, 140, 70, 18, 0)
+	w.codeEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|esReadOnly|wsTabStop, 88, 138, 320, 22, idcCode)
+	w.copyBtn = w.create("BUTTON", "复制", bsPushButton|wsTabStop, 416, 136, 88, 26, idcCopy)
+	w.create("STATIC", "添加好友", 0, 16, 174, 70, 18, 0)
+	w.code2Edit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 88, 172, 320, 22, idcCode2)
+	w.addBtn = w.create("BUTTON", "添加", bsPushButton|wsTabStop, 416, 170, 88, 26, idcAdd)
+	w.addHintTxt = w.create("STATIC", "输入对方的用户名（账号）即可添加", 0, 16, 200, 488, 18, idcAddHint)
 
-	w.create("BUTTON", "设置", bsGroupBox, 8, 420, 504, 136, 0)
-	w.create("STATIC", "昵称", 0, 16, 440, 40, 20, 0)
-	w.nameEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 58, 438, 150, 22, idcName)
-	w.create("STATIC", "服务器", 0, 218, 440, 50, 20, 0)
-	w.serverEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 270, 438, 232, 22, idcServer)
-	w.create("STATIC", "首次使用：填写昵称与服务器地址后点保存。服务器地址形如 ws://主机:9090/ws", 0, 16, 468, 488, 18, 0)
-	w.saveBtn = w.create("BUTTON", "保存并连接", bsPushButton|wsTabStop, 16, 496, 120, 28, idcSave)
-	w.quitBtn = w.create("BUTTON", "退出", bsPushButton|wsTabStop, 392, 496, 80, 28, idcQuit)
+	w.create("BUTTON", "房间", bsGroupBox, 8, 226, 504, 78, 0)
+	w.roomCreateBtn = w.create("BUTTON", "创建房间", bsPushButton|wsTabStop, 16, 246, 92, 26, idcRoomCreate)
+	w.create("STATIC", "房间码", 0, 116, 250, 46, 18, 0)
+	w.roomCodeEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 164, 244, 110, 22, idcRoomCode)
+	w.roomJoinBtn = w.create("BUTTON", "加入房间", bsPushButton|wsTabStop, 282, 244, 92, 26, idcRoomJoin)
+	w.roomLeaveBtn = w.create("BUTTON", "离开房间", bsPushButton|wsTabStop, 282, 244, 92, 26, idcRoomLeave)
+	w.roomStateTxt = w.create("STATIC", "未加入房间", 0, 16, 278, 488, 18, idcRoomState)
+
+	w.create("BUTTON", "连接状态", bsGroupBox, 8, 308, 504, 252, 0)
+	w.listBox = w.create("LISTBOX", "", wsBorder|wsVScroll|lbsNotify, 16, 326, 488, 200, idcList)
+	w.deleteBtn = w.create("BUTTON", "删除选中好友", bsPushButton|wsTabStop, 16, 532, 120, 26, idcDelete)
+
+	w.create("BUTTON", "设置", bsGroupBox, 8, 564, 504, 128, 0)
+	w.create("STATIC", "昵称", 0, 16, 584, 40, 20, 0)
+	w.nameEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 58, 582, 150, 22, idcName)
+	w.create("STATIC", "服务器", 0, 218, 584, 50, 20, 0)
+	w.serverEdit = w.create("EDIT", "", wsBorder|esAutoHScroll|wsTabStop, 270, 582, 232, 22, idcServer)
+	w.create("STATIC", "首次使用：填写昵称与服务器地址后点保存。服务器地址形如 ws://主机:9090/ws", 0, 16, 612, 488, 18, 0)
+	w.saveBtn = w.create("BUTTON", "保存并连接", bsPushButton|wsTabStop, 16, 640, 120, 28, idcSave)
+	w.quitBtn = w.create("BUTTON", "退出", bsPushButton|wsTabStop, 392, 640, 80, 28, idcQuit)
 }
 
 // loadFonts picks the stock GUI font for all controls and a bold face for the
@@ -450,9 +550,12 @@ func (w *Window) loadFonts() {
 
 func (w *Window) applyFonts() {
 	for _, h := range []uintptr{
-		w.statusTxt, w.codeEdit, w.name2Edit, w.code2Edit, w.listBox,
+		w.statusTxt, w.codeEdit, w.code2Edit, w.listBox,
 		w.copyBtn, w.addBtn, w.deleteBtn, w.nameEdit, w.serverEdit,
 		w.saveBtn, w.quitBtn,
+		w.acctEdit, w.passEdit, w.loginBtn, w.registerBtn, w.logoutBtn,
+		w.acctStateTxt, w.addHintTxt, w.roomCreateBtn, w.roomCodeEdit,
+		w.roomJoinBtn, w.roomLeaveBtn, w.roomStateTxt,
 	} {
 		procSendMessageW.Call(h, wmSetFont, w.font, 1)
 	}
