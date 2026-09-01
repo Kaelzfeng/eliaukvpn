@@ -38,8 +38,10 @@ type Config struct {
 
 	// M7c game panel: remembered paths so the user sets them once. Empty means
 	// "auto-detect next start".
-	Java     string `json:"java,omitempty"`
+	Java      string `json:"java,omitempty"`
 	ServerJar string `json:"server_jar,omitempty"`
+	Launcher  string `json:"launcher,omitempty"`
+	GameDir   string `json:"game_dir,omitempty"`
 }
 
 // DefaultPath returns the per-user config path. On Windows this is

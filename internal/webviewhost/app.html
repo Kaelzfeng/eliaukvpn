@@ -58,7 +58,7 @@
 
   /* ---- main ---- */
   .main { flex: 1; overflow-y: auto; background: #1E1F22; }
-  .section { display: none; padding: 26px 30px 36px; max-width: 960px; }
+  .section { display: none; padding: 26px 30px 36px; width: 100%; }
   .section.active { display: block; animation: fadeIn .16s ease; }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
@@ -86,7 +86,7 @@
 
   /* overview */
   .hero .status-row { display: flex; align-items: center; gap: 12px; }
-  .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }
   .stat { border-left-width: 3px; padding: 14px 16px; margin-bottom: 0; cursor: default; }
   .stat:hover { transform: translateY(-2px); border-color: #3C3C46; }
   .stat-label { color: #8B8E95; font-size: 12px; margin-bottom: 6px; }
@@ -148,6 +148,12 @@
   .btn-bar button { flex: 1 1 auto; min-width: 0; }
   .game-state { font-size: 12px; color: #8B8E95; margin-top: 9px; line-height: 1.4; overflow-wrap: anywhere; }
 
+  /* about */
+  .about-hero { display: flex; align-items: center; gap: 14px; }
+  .about-hero .brand-mark { width: 44px; height: 44px; border-radius: 10px; font-size: 20px; }
+  .about-name { font-size: 17px; font-weight: 700; }
+  .about-ver { font-size: 13px; color: #8B8E95; font-family: Consolas, "Cascadia Mono", monospace; margin-top: 2px; }
+
   /* narrow window: sidebar becomes a top bar */
   @media (max-width: 720px) {
     .shell { flex-direction: column; }
@@ -158,7 +164,6 @@
     .nav-item { width: auto; padding: 8px 12px; white-space: nowrap; }
     .sidebar-foot { display: none; }
     .section { padding: 18px 16px 28px; }
-    .stat-grid { grid-template-columns: repeat(2, 1fr); }
   }
 </style>
 </head>
@@ -176,6 +181,7 @@
       <button class="nav-item" data-sec="game">游戏</button>
       <button class="nav-item" data-sec="account">账号</button>
       <button class="nav-item" data-sec="settings">设置</button>
+      <button class="nav-item" data-sec="about">关于</button>
     </nav>
     <div class="sidebar-foot">
       <div class="mini-status">
@@ -251,6 +257,10 @@
         <input type="text" id="java" placeholder="javaw.exe 路径">
         <div class="label">服务器 jar 路径</div>
         <input type="text" id="jar" placeholder="server.jar 路径">
+        <div class="label">启动器路径</div>
+        <input type="text" id="launcher" placeholder="PCL.exe 或 MinecraftLauncher.exe（留空自动检测）">
+        <div class="label">游戏目录 .minecraft</div>
+        <input type="text" id="gameDir" placeholder=".minecraft 目录（留空自动检测）">
         <div class="btn-bar" style="margin-top:4px;">
           <button class="ghost" id="detectBtn">自动检测</button>
           <button id="startBtn">启动服务器</button>
@@ -295,6 +305,25 @@
       </div>
     </section>
 
+    <section class="section" id="sec-about">
+      <h1 class="sec-title">关于</h1>
+      <div class="card about-hero">
+        <span class="brand-mark">E</span>
+        <div>
+          <div class="about-name">Eliauk VPN</div>
+          <div class="about-ver" id="aboutVersion">v1.0.0</div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>说明</h2>
+        <div class="hint" style="margin-top:0;">基于 Wintun 的 P2P 虚拟局域网：异地组网、好友直连、房间联机、Minecraft 服务器托管。</div>
+      </div>
+      <div class="card">
+        <h2>项目</h2>
+        <div class="hint" style="margin-top:0;">github.com/Kaelzfeng/eliaukvpn</div>
+      </div>
+    </section>
+
   </main>
 </div>
 
@@ -332,6 +361,7 @@ function render(s) {
   el("miniStatus").title = st.text || "";
 
   el("fullscreenBtn").textContent = s.fullscreen ? "退出全屏" : "全屏";
+  el("aboutVersion").textContent = "v" + (s.version || "1.0.0");
 
   // overview stats
   el("statFriends").textContent = (s.friends || []).length;
@@ -362,6 +392,8 @@ function render(s) {
 
   setVal("java", s.game && s.game.java);
   setVal("jar", s.game && s.game.jar);
+  setVal("launcher", s.game && s.game.launcher);
+  setVal("gameDir", s.game && s.game.gameDir);
   el("gameState").textContent = (s.game && s.game.state) || "";
   el("copyAddrBtn").disabled = !(s.game && s.game.addr);
 }
@@ -437,8 +469,8 @@ el("copyAddrBtn").addEventListener("click", function () {
   var addr = (window._state && window._state.game && window._state.game.addr) || "";
   if (addr) window.eliauk.action({ type: "copy", text: addr });
 });
-el("mcAddBtn").addEventListener("click", function () { window.eliauk.action({ type: "mcAdd" }); });
-el("launchBtn").addEventListener("click", function () { window.eliauk.action({ type: "launch" }); });
+el("mcAddBtn").addEventListener("click", function () { window.eliauk.action({ type: "mcAdd", gameDir: el("gameDir").value }); });
+el("launchBtn").addEventListener("click", function () { window.eliauk.action({ type: "launch", launcher: el("launcher").value }); });
 el("saveBtn").addEventListener("click", function () { window.eliauk.action({ type: "save", name: el("name").value, server: el("server").value }); });
 
 // fullscreen: F11 toggles, Escape exits when already fullscreen

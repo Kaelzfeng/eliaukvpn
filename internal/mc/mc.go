@@ -55,6 +55,95 @@ func LauncherExe() string {
 	return ""
 }
 
+// pclExeNames are the executables the Plain Craft Launcher (PCL/PCL2) ships as.
+// PCL is a popular third-party launcher that lives outside .minecraft, so it
+// needs its own detection.
+var pclExeNames = []string{
+	"PCL.exe",
+	"PCL2.exe",
+	"PCL2 CE.exe",
+	"Plain Craft Launcher.exe",
+	"PlainCraftLauncher.exe",
+}
+
+// FindPCL locates a Plain Craft Launcher executable in the places a portable
+// launcher usually lives (Desktop / Downloads / Documents, then Program Files).
+// The search is shallow (depth-limited) so it stays fast.
+func FindPCL() string {
+	var dirs []string
+	if home := os.Getenv("USERPROFILE"); home != "" {
+		dirs = append(dirs,
+			filepath.Join(home, "Desktop"),
+			filepath.Join(home, "Downloads"),
+			filepath.Join(home, "Documents"),
+		)
+	}
+	for _, v := range []string{"ProgramFiles", "ProgramFiles(x86)", "LocalAppData"} {
+		if r := os.Getenv(v); r != "" {
+			dirs = append(dirs, r)
+		}
+	}
+	for _, d := range dirs {
+		if p := findExeNamed(d, pclExeNames); p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+// findExeNamed walks root (depth-limited) looking for a file whose name matches
+// any of names (case-insensitive). It returns "" when nothing matches.
+func findExeNamed(root string, names []string) string {
+	if !isDir(root) {
+		return ""
+	}
+	var found string
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if found != "" {
+			return filepath.SkipAll
+		}
+		if rel, e := filepath.Rel(root, path); e == nil && rel != "." && strings.Count(rel, string(os.PathSeparator)) > 3 {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !info.IsDir() {
+			for _, n := range names {
+				if strings.EqualFold(info.Name(), n) {
+					found = path
+					return filepath.SkipAll
+				}
+			}
+		}
+		return nil
+	})
+	return found
+}
+
+// LauncherPath returns the best launcher to start: PCL first (the launcher
+// offline-account players usually use), then the official launcher.
+func LauncherPath() string {
+	if p := FindPCL(); p != "" {
+		return p
+	}
+	return LauncherExe()
+}
+
+// GameDir returns the .minecraft directory to write servers.dat into: PCL's
+// (next to its exe) when present, otherwise the official one.
+func GameDir() string {
+	if p := FindPCL(); p != "" {
+		if d := filepath.Join(filepath.Dir(p), ".minecraft"); isDir(d) {
+			return d
+		}
+	}
+	return MinecraftDir()
+}
+
 // FindJava locates a java runtime: $JAVA_HOME first, then the well-known
 // Windows install trees (Adoptium/Java/Microsoft/Corretto), then the Java
 // runtimes the Minecraft launcher bundles under .minecraft\runtime, then PATH.
@@ -244,11 +333,14 @@ func (s *Server) Stop() {
 	_ = s.cmd.Process.Kill()
 }
 
-// LaunchLauncher starts the official Minecraft launcher so the user can play.
-func LaunchLauncher() error {
-	exe := LauncherExe()
+// LaunchLauncher starts the user's Minecraft launcher: PCL when detected,
+// otherwise the official launcher. exe, when non-empty, overrides detection.
+func LaunchLauncher(exe string) error {
 	if exe == "" {
-		return errors.New("未找到 Minecraft 启动器（.minecraft\\launcher\\MinecraftLauncher.exe）")
+		exe = LauncherPath()
+	}
+	if exe == "" {
+		return errors.New("未找到 Minecraft 启动器（PCL 或 .minecraft\\launcher\\MinecraftLauncher.exe）")
 	}
 	if err := exec.Command(exe).Start(); err != nil {
 		return fmt.Errorf("启动游戏失败: %w", err)

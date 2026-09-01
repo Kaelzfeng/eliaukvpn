@@ -19,19 +19,19 @@ import (
 
 // NBT tag type bytes (spec.toolshed / "Unnamed Binary Tag").
 const (
-	tagEnd        = 0x00
-	tagByte       = 0x01
-	tagShort      = 0x02
-	tagInt        = 0x03
-	tagLong       = 0x04
-	tagFloat      = 0x05
-	tagDouble     = 0x06
-	tagByteArray  = 0x07
-	tagString     = 0x08
-	tagList       = 0x09
-	tagCompound   = 0x0A
-	tagIntArray   = 0x0B
-	tagLongArray  = 0x0C
+	tagEnd       = 0x00
+	tagByte      = 0x01
+	tagShort     = 0x02
+	tagInt       = 0x03
+	tagLong      = 0x04
+	tagFloat     = 0x05
+	tagDouble    = 0x06
+	tagByteArray = 0x07
+	tagString    = 0x08
+	tagList      = 0x09
+	tagCompound  = 0x0A
+	tagIntArray  = 0x0B
+	tagLongArray = 0x0C
 )
 
 // nbtNode is one named NBT value. For compound nodes val is []*nbtNode (ordered
@@ -67,15 +67,17 @@ func (n *nbtNode) set(name string, typ byte, val any) {
 }
 
 // AddServerToLauncher inserts (or updates) a server {name, addr} entry into the
-// official launcher's multiplayer list at %AppData%\.minecraft\servers.dat. The
-// original file is preserved as servers.dat.bak first. Returns true when the
-// list changed.
-func AddServerToLauncher(name, addr string) (bool, error) {
-	mc := MinecraftDir()
-	if mc == "" {
+// launcher's multiplayer list (servers.dat). gameDir, when empty, is auto-detected
+// (PCL's .minecraft, then the official one). The original file is preserved as
+// servers.dat.bak first. Returns true when the list changed.
+func AddServerToLauncher(name, addr, gameDir string) (bool, error) {
+	if gameDir == "" {
+		gameDir = GameDir()
+	}
+	if gameDir == "" {
 		return false, fmt.Errorf("未找到 .minecraft 目录")
 	}
-	return addServerToLauncherIn(mc, name, addr)
+	return addServerToLauncherIn(gameDir, name, addr)
 }
 
 // addServerToLauncherIn does the merge inside a given .minecraft directory

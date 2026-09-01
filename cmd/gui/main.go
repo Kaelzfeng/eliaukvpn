@@ -41,6 +41,10 @@ const (
 	actQuit = 2 // quit Eliauk
 )
 
+// version is the build version shown in the 关于 panel and printed by -version.
+// Override at build time with: go build -ldflags "-X main.version=1.2.3".
+var version = "1.0.0"
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -66,8 +70,14 @@ func run() error {
 		passwordFlag  = flag.String("password", "", "password for -account")
 		createFlag    = flag.Bool("create-account", false, "register -account instead of logging in")
 		gameStartJar  = flag.String("game-start", "", "automation hook: start the dedicated server with this jar after registering (e2e)")
+		versionFlag   = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(version)
+		return nil
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -127,7 +137,15 @@ func run() error {
 	if a.mcJar == "" {
 		a.mcJar = mc.FindServerJar()
 	}
-	log.Printf("game: java=%q server-jar=%q", a.mcJava, a.mcJar)
+	a.mcLauncher = cfg.Launcher
+	if a.mcLauncher == "" {
+		a.mcLauncher = mc.LauncherPath()
+	}
+	a.mcGameDir = cfg.GameDir
+	if a.mcGameDir == "" {
+		a.mcGameDir = mc.GameDir()
+	}
+	log.Printf("game: java=%q server-jar=%q launcher=%q gamedir=%q", a.mcJava, a.mcJar, a.mcLauncher, a.mcGameDir)
 
 	// Automation hook: log in / register an account on startup (used by the e2e
 	// script). The plaintext password lives only in a.pendingPass and is never
@@ -280,10 +298,12 @@ type app struct {
 
 	// M7c game panel: remembered Java / server.jar paths, the running dedicated
 	// server process, and a short tail of its output (all under mu).
-	mcJava string
-	mcJar  string
-	mcSrv  *mc.Server
-	mcTail []string
+	mcJava     string
+	mcJar      string
+	mcLauncher string
+	mcGameDir  string
+	mcSrv      *mc.Server
+	mcTail     []string
 
 	quitOnce sync.Once
 }
@@ -518,6 +538,7 @@ func (a *app) state() webviewhost.State {
 
 	s := webviewhost.State{
 		Fullscreen: a.ui.Fullscreen(),
+		Version:    version,
 		Code:       a.myCode,
 		Settings:   webviewhost.Settings{Name: cfg.Name, Server: cfg.Server},
 	}
@@ -583,6 +604,7 @@ func (a *app) state() webviewhost.State {
 	// otherwise the room host's address is the one to join.
 	a.mu.Lock()
 	s.Game.Java, s.Game.Jar = a.mcJava, a.mcJar
+	s.Game.Launcher, s.Game.GameDir = a.mcLauncher, a.mcGameDir
 	gameRunning := a.mcSrv != nil && a.mcSrv.Running()
 	a.mu.Unlock()
 	s.Game.Running = gameRunning
@@ -757,9 +779,9 @@ func (a *app) handleAction(act webviewhost.Action) {
 	case webviewhost.ActSrvStop:
 		a.stopGame()
 	case webviewhost.ActMCAdd:
-		a.addToLauncher()
+		a.addToLauncher(act.GameDir)
 	case webviewhost.ActLaunch:
-		a.launchGame()
+		a.launchGame(act.Launcher)
 	case webviewhost.ActFullscreen:
 		a.ui.ToggleFullscreen()
 		a.ui.Push(a.state())
@@ -1005,11 +1027,26 @@ func (a *app) persistGamePaths(java, jar string) {
 	}
 }
 
+// persistLauncher remembers the detected launcher / game directory so they are
+// not re-detected (and possibly mis-detected) on every start.
+func (a *app) persistLauncher(launcher, gameDir string) {
+	a.mu.Lock()
+	a.mcLauncher, a.mcGameDir = launcher, gameDir
+	a.cfg.Launcher, a.cfg.GameDir = launcher, gameDir
+	a.mu.Unlock()
+	if err := a.cfg.Save(a.cfgPath); err != nil {
+		a.setNote("保存配置失败："+err.Error(), false)
+	}
+}
+
 // detectGame re-runs Java / server.jar detection and fills the edit boxes.
 func (a *app) detectGame() {
 	java := mc.FindJava()
 	jar := mc.FindServerJar()
+	launcher := mc.LauncherPath()
+	gameDir := mc.GameDir()
 	a.persistGamePaths(java, jar)
+	a.persistLauncher(launcher, gameDir)
 	switch {
 	case java == "" && jar == "":
 		a.setNote("未找到 Java 和服务器 jar，请手动填写路径", false)
@@ -1078,7 +1115,7 @@ func (a *app) stopGame() {
 
 // addToLauncher registers the current joinable address in the official
 // launcher's multiplayer list (servers.dat), so joining is one click.
-func (a *app) addToLauncher() {
+func (a *app) addToLauncher(gameDir string) {
 	addr := a.joinableAddr()
 	if addr == "" {
 		a.setNote("暂无可添加的地址：请先启动服务器，或加入有房主的房间", false)
@@ -1093,16 +1130,26 @@ func (a *app) addToLauncher() {
 			name = "Eliauk [" + room.Code + "]"
 		}
 	}
-	if _, err := mc.AddServerToLauncher(name, addr); err != nil {
+	if gameDir == "" {
+		a.mu.Lock()
+		gameDir = a.mcGameDir
+		a.mu.Unlock()
+	}
+	if _, err := mc.AddServerToLauncher(name, addr, gameDir); err != nil {
 		a.setNote(err.Error(), false)
 		return
 	}
 	a.setNote("已添加服务器 "+name+" → "+addr+"，打开启动器即可加入", true)
 }
 
-// launchGame starts the official Minecraft launcher.
-func (a *app) launchGame() {
-	if err := mc.LaunchLauncher(); err != nil {
+// launchGame starts the user's Minecraft launcher (PCL or official).
+func (a *app) launchGame(launcher string) {
+	if launcher == "" {
+		a.mu.Lock()
+		launcher = a.mcLauncher
+		a.mu.Unlock()
+	}
+	if err := mc.LaunchLauncher(launcher); err != nil {
 		a.setNote(err.Error(), false)
 		return
 	}

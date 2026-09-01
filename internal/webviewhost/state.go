@@ -36,11 +36,13 @@ type RoomInfo struct {
 
 // GameInfo is the game section state.
 type GameInfo struct {
-	Java    string `json:"java"`
-	Jar     string `json:"jar"`
-	Running bool   `json:"running"`
-	State   string `json:"state"`
-	Addr    string `json:"addr"` // joinable address ip:25565, "" if none
+	Java     string `json:"java"`
+	Jar      string `json:"jar"`
+	Running  bool   `json:"running"`
+	State    string `json:"state"`
+	Addr     string `json:"addr"` // joinable address ip:25565, "" if none
+	Launcher string `json:"launcher"`
+	GameDir  string `json:"gameDir"`
 }
 
 // Settings is the settings section state.
@@ -53,6 +55,7 @@ type Settings struct {
 type State struct {
 	Status     StatusInfo   `json:"status"`
 	Fullscreen bool         `json:"fullscreen"`
+	Version    string       `json:"version"`
 	Code       string       `json:"code"`
 	Account    string       `json:"account"`
 	LoggedIn   bool         `json:"loggedIn"`
