@@ -1,6 +1,7 @@
 # Go build output
 bin/
 *.exe
+*.exe~
 *.test
 *.out
 wintun.dll
