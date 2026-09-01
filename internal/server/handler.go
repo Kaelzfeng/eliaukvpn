@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -15,6 +16,17 @@ var upgrader = websocket.Upgrader{
 	// M1: accept any origin. Lock this down before any production use.
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
+
+// WebSocket heartbeat timing (server side; the client mirrors these). The
+// server pings every serverPingPeriod and requires a pong within
+// serverPongWait, keeping an idle link alive through an idle timeout such as
+// Cloudflare's ~100s cutoff and detecting dead clients so their registration is
+// released.
+const (
+	serverPongWait   = 60 * time.Second
+	serverPingPeriod = 20 * time.Second
+	serverWriteWait  = 10 * time.Second
+)
 
 // HandleWS upgrades one client connection, drives the register handshake (which
 // in M7 authenticates an account or creates one) and then relays control
@@ -108,6 +120,36 @@ func HandleWS(reg *Registry, acct *AccountStore, relayAddr string, w http.Respon
 		}
 		broadcastPeers(reg, acct)
 		log.Printf("client left: id=%s", client.ID)
+	}()
+
+	// Heartbeat: keep the link alive through an idle timeout and tear down a
+	// dead client so its virtual IP / account binding are released. Registered
+	// after the cleanup defer so close(done) runs first and the ping goroutine
+	// stops before Remove/broadcastPeers touch the connection.
+	conn.SetReadDeadline(time.Now().Add(serverPongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(serverPongWait))
+		return nil
+	})
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(serverPingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				client.writeMu.Lock()
+				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(serverWriteWait))
+				client.writeMu.Unlock()
+				if err != nil {
+					conn.Close() // force the read loop below to return
+					return
+				}
+			}
+		}
 	}()
 
 	log.Printf("client joined: id=%s name=%q account=%q virtual_ip=%s", client.ID, client.Name, account, client.VirtualIP)

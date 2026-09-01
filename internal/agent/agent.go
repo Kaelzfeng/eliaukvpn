@@ -32,6 +32,17 @@ import (
 	"eliaukvpn/internal/vnic"
 )
 
+// WebSocket heartbeat timing (see Run/messageLoop/pingLoop). The client pings
+// the server every wsPingPeriod and requires a pong within wsPongWait, which
+// (a) keeps an otherwise-idle link alive through an idle timeout such as
+// Cloudflare's ~100s WebSocket cutoff and (b) detects a dead link so the agent
+// tears down and reconnects.
+const (
+	wsPongWait   = 60 * time.Second
+	wsPingPeriod = 20 * time.Second
+	wsWriteWait  = 10 * time.Second
+)
+
 // Options configures the agent. Fields mirror cmd/client's flags.
 type Options struct {
 	Name          string
@@ -122,7 +133,8 @@ type Agent struct {
 
 	vnicErr string
 
-	wsErr chan error
+	wsErr   chan error
+	writeMu sync.Mutex // serializes WS writes (data + heartbeat ping)
 }
 
 // RoomState is the agent's view of the room it is in (nil when not in one).
@@ -251,7 +263,10 @@ func New(opts Options) (*Agent, error) {
 // Run starts the WebSocket message loop and blocks until the context is
 // cancelled or the server connection fails.
 func (a *Agent) Run(ctx context.Context) error {
+	pingCtx, stopPing := context.WithCancel(ctx)
+	defer stopPing()
 	go a.messageLoop()
+	go a.pingLoop(pingCtx)
 	var err error
 	select {
 	case <-ctx.Done():
@@ -325,7 +340,7 @@ func (a *Agent) Connect(nameOrID string) error {
 	if !ok {
 		return fmt.Errorf("no such peer: %s", nameOrID)
 	}
-	if err := send(a.conn, protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: peer.ID}); err != nil {
+	if err := a.writeJSON(protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: peer.ID}); err != nil {
 		return fmt.Errorf("send connect_request: %w", err)
 	}
 	return nil
@@ -474,7 +489,7 @@ func (a *Agent) AddFriendByName(username string) error {
 	if a.myAccount == "" {
 		return fmt.Errorf("请先登录账号")
 	}
-	return send(a.conn, protocol.TypeFriendAdd, protocol.FriendAdd{Username: username})
+	return a.writeJSON(protocol.TypeFriendAdd, protocol.FriendAdd{Username: username})
 }
 
 // RemoveFriendByName asks the server to drop a friend by username (symmetric).
@@ -488,7 +503,7 @@ func (a *Agent) RemoveFriendByName(username string) error {
 	if a.myAccount == "" {
 		return fmt.Errorf("请先登录账号")
 	}
-	return send(a.conn, protocol.TypeFriendRemove, protocol.FriendRemove{Username: username})
+	return a.writeJSON(protocol.TypeFriendRemove, protocol.FriendRemove{Username: username})
 }
 
 // RoomState returns the current room (nil when not in one). A copy is returned
@@ -512,7 +527,7 @@ func (a *Agent) CreateRoom() error {
 	if a.myAccount == "" {
 		return fmt.Errorf("请先登录账号")
 	}
-	return send(a.conn, protocol.TypeRoomCreate, struct{}{})
+	return a.writeJSON(protocol.TypeRoomCreate, struct{}{})
 }
 
 // JoinRoom asks the server to add us to the room with the given code.
@@ -526,7 +541,7 @@ func (a *Agent) JoinRoom(code string) error {
 	if a.myAccount == "" {
 		return fmt.Errorf("请先登录账号")
 	}
-	return send(a.conn, protocol.TypeRoomJoin, protocol.RoomJoin{Code: code})
+	return a.writeJSON(protocol.TypeRoomJoin, protocol.RoomJoin{Code: code})
 }
 
 // LeaveRoom asks the server to remove us from the current room.
@@ -536,7 +551,7 @@ func (a *Agent) LeaveRoom() error {
 	if a.myAccount == "" {
 		return fmt.Errorf("请先登录账号")
 	}
-	return send(a.conn, protocol.TypeRoomLeave, struct{}{})
+	return a.writeJSON(protocol.TypeRoomLeave, struct{}{})
 }
 
 // setFriendDirectory replaces the whole account friend directory (full refresh
@@ -622,6 +637,15 @@ func memberFPs(self string, members []protocol.RoomMember) [][]byte {
 // messageLoop consumes server messages and drives the tunnel, virtual NIC,
 // and LAN-discovery emulation. It runs until the connection dies.
 func (a *Agent) messageLoop() {
+	// Arm the read deadline and refresh it on every pong the server answers
+	// with (gorilla auto-pongs our pings). If the link goes silent for
+	// wsPongWait — a dead server or an idle tunnel drop — ReadJSON returns a
+	// timeout and Run surfaces it so the caller reconnects.
+	a.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	a.conn.SetPongHandler(func(string) error {
+		a.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		return nil
+	})
 	for {
 		var env protocol.Envelope
 		if err := a.conn.ReadJSON(&env); err != nil {
@@ -920,7 +944,7 @@ func (a *Agent) autoConnect(peers []protocol.Peer) {
 		a.ensurePeerRoute(vip)
 	}
 	for _, p := range fresh {
-		if err := send(a.conn, protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: p.ID}); err != nil {
+		if err := a.writeJSON(protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: p.ID}); err != nil {
 			a.opts.Logf("warning: auto-connect %s: %v", p.Name, err)
 		}
 	}
@@ -937,7 +961,7 @@ func (a *Agent) reportEndpoint() {
 		ep.PublicIP = a.probe.Mapped.IP.String()
 		ep.PublicPort = a.probe.Mapped.Port
 	}
-	if err := send(a.conn, protocol.TypeReportEndpoint, ep); err != nil {
+	if err := a.writeJSON(protocol.TypeReportEndpoint, ep); err != nil {
 		a.opts.Logf("warning: report endpoint: %v", err)
 	}
 }
@@ -1051,6 +1075,45 @@ func resolvePeer(byID, byName map[string]protocol.Peer, key string) (protocol.Pe
 		return p, true
 	}
 	return protocol.Peer{}, false
+}
+
+// writeJSON serializes and writes an envelope under the write lock so user
+// actions, auto-connect and the heartbeat ping never interleave (gorilla allows
+// only one concurrent writer).
+func (a *Agent) writeJSON(typ string, data any) error {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	return a.conn.WriteJSON(protocol.Envelope{Type: typ, Data: raw})
+}
+
+// pingLoop sends a periodic WebSocket ping to keep an idle coordination link
+// alive (e.g. through Cloudflare, which drops idle tunnels after ~100s) and to
+// detect a dead peer. A failed write tears the connection down via wsErr so Run
+// returns and the caller reconnects.
+func (a *Agent) pingLoop(ctx context.Context) {
+	ticker := time.NewTicker(wsPingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.writeMu.Lock()
+			err := a.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait))
+			a.writeMu.Unlock()
+			if err != nil {
+				select {
+				case a.wsErr <- err:
+				default:
+				}
+				return
+			}
+		}
+	}
 }
 
 func send(conn *websocket.Conn, typ string, data any) error {
