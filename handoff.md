@@ -81,6 +81,33 @@
   2. 互加好友白名单；3. 一台开 MC 局域网房（或 `mcprobe.exe -mode server`），另一台 `mcprobe.exe -mode client` 应看到 `discovered world ... at <hostVIP> (port 25565)` 且 `TCP connect OK`；
   4. 验收点：发现包源是虚拟 IP（只能来自隧道）、TCP 握手 `--debug-packets` 双向实锤、真实 NAT 打洞成功（不用 `--force-relay`）。
 
+## Cloudflare Tunnel 异地组网（命名隧道，2026-09-01 已部署验证）
+
+没有公网 IP 的机器也能把信令暴露到固定域名 —— 用 **Cloudflare 命名隧道**（零入站端口、零端口映射）。
+
+**已部署固定地址**：`wss://vpn.kaelzfeng.uk/ws`（`curl` 验证 `HTTP/1.1 101 Switching Protocols` 通过，`Server: cloudflare`）。
+
+- **隧道名** `eliauk`；**隧道 ID** `1278f0c5-2a4d-441b-a91b-fd6936820c95`
+- **证书** `C:\Users\zc bx\.cloudflared\cert.pem`（`tunnel login` 生成）
+- **凭据** `C:\Users\zc bx\.cloudflared\1278f0c5-2a4d-441b-a91b-fd6936820c95.json`
+- **配置** `C:\Users\zc bx\.cloudflared\config.yml`：
+  ```yaml
+  tunnel: 1278f0c5-2a4d-441b-a91b-fd6936820c95
+  credentials-file: C:/Users/zc bx/.cloudflared/1278f0c5-2a4d-441b-a91b-fd6936820c95.json
+  ingress:
+    - hostname: vpn.kaelzfeng.uk
+      service: http://localhost:9090
+    - service: http_status:404
+  ```
+- **DNS**：`vpn.kaelzfeng.uk` CNAME → 隧道（`cloudflared tunnel route dns eliauk vpn.kaelzfeng.uk`）
+- **重起**：`cloudflared tunnel run eliauk`（cert/config 已落盘，不用再 `login`）
+
+**首次搭建流程（换域名/换机器照着来）**：1. `cloudflared tunnel login`（浏览器授权 → cert.pem）→ 2. `cloudflared tunnel create eliauk`（拿隧道 ID + credentials.json）→ 3. `cloudflared tunnel route dns eliauk vpn.<域名>`（加 CNAME）→ 4. 写上面的 `config.yml` → 5. `cloudflared tunnel run eliauk`。
+
+**心跳（防 CF ~100s 空闲断链，提交 `4f30cc8`）**：客户端 `agent.go` 与服务器 `handler.go` 都加了对称 WS 心跳（20s ping / 60s pong / 10s write wait）。客户端写侧用 `writeMu sync.Mutex` 串行化 —— 修了「UI 动作与 autoConnect 并发写同一 conn」的潜在竞态（gorilla 只允许单写者）。
+
+**踩坑**：CF precheck 里 `TCP Connectivity 7844 FAIL` 是正常的（环境回退到 QUIC 传输 `suggested_protocol=quic`），不影响 WebSocket 流量。`tunnel login` 第一次授权 URL 的 `aud=` 可能为空（落在「域名概览」页），停掉重跑即可。
+
 ## M6c 详情（Windows 托盘 GUI，已 e2e 验证）
 - **`internal/agent`（重构核心）**：把 `cmd/client` 的注册/STUN/隧道/网卡/广播/自动连接逻辑抽成可复用包；`Agent` 暴露 `Peers()/Snapshot()/Connect()/Status()/Run(ctx)`。CLI（交互式）和 GUI（托盘）共用同一内核 —— 之前双端代码是复制粘贴的，现在一份实现。
 - **`internal/tray`（纯 Win32，零新依赖）**：`syscall.NewLazyDLL` 直调 user32/shell32 —— `RegisterClassW`+`CreateWindowExW`（**消息窗口 parent = `HWND_MESSAGE` = (HWND)-3，不是 -1！** -1 是 `HWND_TOPMOST`，会报 `ERROR_INVALID_WINDOW_HANDLE` 1400）+ `GetMessageW` 泵 + `Shell_NotifyIconW`（NIM_ADD/MODIFY/DELETE）+ 右键 `TrackPopupMenu`（`TPM_RETURNCMD` 直接拿命令 id）。托盘图标是运行时画的 32x32 ICO（绿色圆盘 + 白色 E），写临时文件 `LoadImageW` 加载，无二进制资产。菜单模型 `Item`（Label/Separator/Disabled/Submenu/ID），每次右键按当前模型重建（`AppendMenuW` 复制字符串）。
@@ -149,7 +176,7 @@
 7. **M7 已完成** ✅（MCTier 式改造，2026-08-31）：M7a 账号+好友+在线状态 → M7b 房间一键加入 → M7c 游戏启动器集成，全部落地（单测 + `TestRoomIntegration` 集成测试 + `e2e-gui.ps1` 三阶段 e2e 验证）
 8. **UI 焕新已完成** ✅（2026-09-01，提交 `31f850c`）：深色模式 + 全面焕新（见上方「UI 焕新详情」），像素采样/单测/e2e 全绿，已推送
 9. **M9 跨机验证**（下一步，需用户两台真机）：真机双端跑 `gui.exe`（账号注册→建房→分享房间码，或互加好友码）或 `mcprobe`，确认发现 + TCP 走公网隧道（同机已验证，跨机是最终确认；顺带覆盖真实 NAT 打洞）
-10. 待定：协调服务器 VPS 选型（用户说「vps最后再搞」）、`ensurePeerRoute` 的对端下线路由清理（目前 route 只加不删，peer 下线后 VIP 包会发向已失效 peer 被丢弃——对 M5 无碍）
+10. ~~协调服务器 VPS 选型~~ ✅ 已用 Cloudflare 命名隧道解决（2026-09-01，固定地址 `wss://vpn.kaelzfeng.uk/ws`，见「Cloudflare Tunnel 异地组网」节）；待定：`ensurePeerRoute` 的对端下线路由清理（目前 route 只加不删，peer 下线后 VIP 包会发向已失效 peer 被丢弃——对 M5 无碍）
 
 ## 里程碑速览
 M0 文档 ✅ → M1 协调服务器/STUN ✅ → M2 打洞直连 ✅ → M3 中继回退 ✅ → M4 虚拟网卡打通 ✅ → M5 游戏链路（MC 局域网发现）✅
@@ -160,7 +187,7 @@ M0 文档 ✅ → M1 协调服务器/STUN ✅ → M2 打洞直连 ✅ → M3 中
 ## 环境备注
 - Windows 11，开发机；Go 在 `C:\Program Files\Go\bin\go.exe`（新 shell 需用全路径或重设 `$env:Path`）。
 - `git init` 完成，关联 `https://github.com/Kaelzfeng/eliaukvpn`（origin/main），已推送。
-- 协调服务器将来需要一台公网 VPS（暂未部署）。
+- 协调服务器的公网暴露：~~需要公网 VPS~~ 已用 **Cloudflare 命名隧道**解决（见「Cloudflare Tunnel 异地组网」节），固定地址 `wss://vpn.kaelzfeng.uk/ws`，无需公网 IP。
 - **遗留进程**：`eliauk-server.exe`（PID 134868，占 8080/8081）非本会话创建，权限限制不可杀 → 测试一律用 9090/9091。
 - 本机多 VPN 网卡（Tailscale 100.x、singbox_tun 172.18.0.1、operator-member-2 10.66.66.128、vEthernet 172.22.48.1），真实 LAN IP 192.168.0.100；测试用公网 hairpin 188.253.121.28。
 - 诊断小工具在 `cmd/`：`mcprobe`（假 MC 服务端/客户端）、`twonet`/`readpath`/`iprobe`/`injtest`/`iptime`/`injvar`/`mcast`（M4/M5 调试用，可随时清理）。
