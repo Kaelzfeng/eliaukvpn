@@ -15,3 +15,6 @@ accounts.json
 *.key
 *.err
 pktmon.txt
+
+signing/
+*.priv

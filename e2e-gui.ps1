@@ -1,19 +1,15 @@
-# e2e-gui.ps1 — end-to-end test for the Eliauk GUI (M6d foolproof + M7a accounts + M7c game panel).
+# e2e-gui.ps1 — end-to-end test for the Eliauk GUI (M6d foolproof + M7b rooms + M7c game panel).
 #
 # Drives the real GUI binary against a local coordination server on 9090/9091:
 #
-#  Phase A (legacy anonymous p2p): two GUI instances start from pre-written
-#    config.json, whitelist each other by fingerprint, establish an encrypted
-#    session (p2p: session established), and the mcprobe client reaches the
-#    server world at the host's *virtual* IP over TCP.
+#  Phase A (room p2p): the host GUI creates a room (-create-room), the join GUI
+#    joins it by code (-join-room), the two auto-whitelist + auto-punch, establish
+#    an encrypted session (p2p: session established), and the mcprobe client
+#    reaches the server world at the host's *virtual* IP over TCP.
 #
-#  Phase B (M7a accounts + session token): one GUI registers a fresh account
-#    via -create-account/-password, caches the server-issued session token in
-#    its config, then logs back in with the token only (no password).
-#
-#  Phase C (M7c game panel): the same GUI auto-starts a dedicated server with a
-#    small Java "server" compiled on the fly (javac+jar), which proves the
-#    game panel writes eula.txt + server.properties, launches java, persists the
+#  Phase B (M7c game panel): the host GUI auto-starts a dedicated server with a
+#    small Java "server" compiled on the fly (javac+jar), which proves the game
+#    panel writes eula.txt + server.properties, launches java, persists the
 #    java/server-jar paths in the config, and stops the server at exit.
 #
 # Requires an elevated shell (Phase A creates virtual NICs). Leaves the machine
@@ -23,7 +19,7 @@
 
 param(
     [string]$ServerAddr = 'ws://127.0.0.1:9090/ws',
-    [int]$GuiLifetime = 50
+    [int]$GuiLifetime = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,6 +53,26 @@ function Wait-Log([string]$path, [string]$pattern, [int]$timeoutSec) {
         Start-Sleep -Milliseconds 500
     }
     return $false
+}
+
+function Get-RoomCode([string]$name, [int]$timeoutSec) {
+    # Extracts the 5-character room code the -create-room hook logs as
+    # "room: created code=XXXXX" (Go log goes to the .err file).
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($p in @("$tmp\$name.out", "$tmp\$name.err")) {
+            if (Test-Path $p) {
+                try {
+                    $m = Select-String -Path $p -Pattern 'room: created code=([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5})' -ErrorAction Stop | Select-Object -Last 1
+                    if ($m -and $m.Matches.Count -gt 0 -and $m.Matches[0].Groups.Count -gt 1) {
+                        return $m.Matches[0].Groups[1].Value
+                    }
+                } catch {}
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $null
 }
 
 function Start-Proc([string]$exe, [string[]]$argList, [string]$name) {
@@ -114,18 +130,24 @@ try {
     Write-Host "  host fp = $hostFp"
     Write-Host "  join fp = $joinFp"
 
-    @{ name='host'; server=$ServerAddr; friends=@(@{ name='join'; code=$joinFp }) } |
-        ConvertTo-Json -Depth 3 | Set-Content -Path "$tmp\host.json" -Encoding UTF8
-    @{ name='join'; server=$ServerAddr; friends=@(@{ name='host'; code=$hostFp }) } |
-        ConvertTo-Json -Depth 3 | Set-Content -Path "$tmp\join.json" -Encoding UTF8
+    @{ name='host'; server=$ServerAddr } |
+        ConvertTo-Json | Set-Content -Path "$tmp\host.json" -Encoding UTF8
+    @{ name='join'; server=$ServerAddr } |
+        ConvertTo-Json | Set-Content -Path "$tmp\join.json" -Encoding UTF8
 
-    Write-Host '=== start server (9090/9091, account store) ==='
-    $serverProc = Start-Proc .\bin\server.exe @('-addr',':9090','-relay-listen','0.0.0.0:9091','-relay-public','127.0.0.1:9091','-accounts',"$tmp\accounts.json") 'server'
+    Write-Host '=== start server (9090/9091) ==='
+    $serverProc = Start-Proc .\bin\server.exe @('-addr',':9090','-relay-listen','0.0.0.0:9091','-relay-public','127.0.0.1:9091') 'server'
     Start-Sleep -Seconds 1
 
-    Write-Host '=== Phase A: legacy anonymous p2p ==='
-    $hostProc = Start-Proc .\bin\gui.exe @('-config',"$tmp\host.json",'-keyfile',"$tmp\host.key",'-vnic-name','Eliauk-e2eh','-exit-after',"${GuiLifetime}s",'-debug-packets') 'host'
-    $joinProc = Start-Proc .\bin\gui.exe @('-config',"$tmp\join.json",'-keyfile',"$tmp\join.key",'-vnic-name','Eliauk-e2ej','-exit-after',"${GuiLifetime}s",'-debug-packets') 'join'
+    Write-Host '=== Phase A: room p2p (host creates room, join joins by code) ==='
+    $hostProc = Start-Proc .\bin\gui.exe @('-config',"$tmp\host.json",'-keyfile',"$tmp\host.key",'-vnic-name','Eliauk-e2eh','-create-room','-exit-after',"${GuiLifetime}s",'-debug-packets') 'host'
+
+    Write-Host '--- wait for room code ---'
+    $roomCode = Get-RoomCode 'host' 25
+    Write-Host "  room code = $roomCode"
+    if (-not $roomCode) { throw 'host did not create a room (no room code logged)' }
+
+    $joinProc = Start-Proc .\bin\gui.exe @('-config',"$tmp\join.json",'-keyfile',"$tmp\join.key",'-vnic-name','Eliauk-e2ej','-join-room',"$roomCode",'-exit-after',"${GuiLifetime}s",'-debug-packets') 'join'
 
     Write-Host '--- wait for registration + session ---'
     $hReg = Wait-Log "$tmp\host.out" 'registered' 25
@@ -153,7 +175,7 @@ try {
     Get-Content "$tmp\join.err","$tmp\join.out" -ErrorAction SilentlyContinue | Select-String 'vnic->tunnel|tunnel->vnic' | Select-Object -First 6
 
     # Phase A data plane proven — release 25565: mcprobe -mode server holds it
-    # forever, which would mask Phase C's fake-Java-server bind/port checks.
+    # forever, which would mask Phase B's fake-Java-server bind/port checks.
     foreach ($p in @($mcSrv, $mcCli)) {
         try { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } } catch {}
     }
@@ -169,33 +191,9 @@ try {
     Get-Content "$tmp\host.json"
     Write-Host "  identity keys: host=$(Test-Path "$tmp\host.key") join=$(Test-Path "$tmp\join.key")"
 
-    Write-Host '=== Phase B: M7a account register -> session token -> token login ==='
-    @{ name='acct'; server=$ServerAddr } | ConvertTo-Json | Set-Content -Path "$tmp\acct.json" -Encoding UTF8
+    Write-Host '=== Phase B: M7c game panel (fake server.jar) ==='
+    @{ name='host'; server=$ServerAddr } | ConvertTo-Json | Set-Content -Path "$tmp\game.json" -Encoding UTF8
 
-    $reg = Start-Proc .\bin\gui.exe @('-config',"$tmp\acct.json",'-keyfile',"$tmp\acct.key",'-account','host','-password','e2epass','-create-account','-vnic=false','-exit-after','25s') 'acct-reg'
-    $r1 = Wait-Log "$tmp\acct-reg.out" 'registered' 25
-    Write-Host "  account registered: $r1"
-    if (-not $r1) { throw 'account registration failed' }
-    [void](Wait-ProcExit $reg 40)
-
-    $acct = Get-Content "$tmp\acct.json" -Raw | ConvertFrom-Json
-    $tokLen = 0
-    if ($acct.token) { $tokLen = $acct.token.Length }
-    Write-Host "  cfg account = '$($acct.account)' (expect 'host'); token bytes = $tokLen (expect > 0)"
-    if ($acct.account -ne 'host' -or $tokLen -le 0) { throw 'account/token not persisted' }
-
-    $tok2 = Start-Proc .\bin\gui.exe @('-config',"$tmp\acct.json",'-keyfile',"$tmp\acct.key",'-account','host','-vnic=false','-exit-after','20s') 'acct-login'
-    $r2 = Wait-Log "$tmp\acct-login.out" 'registered' 25
-    Write-Host "  token-only login registered: $r2"
-    if (-not $r2) { throw 'token-only login failed' }
-    [void](Wait-ProcExit $tok2 35)
-    $acct2 = Get-Content "$tmp\acct.json" -Raw | ConvertFrom-Json
-    $tokLen2 = 0
-    if ($acct2.token) { $tokLen2 = $acct2.token.Length }
-    Write-Host "  token bytes after re-login = $tokLen2 (must be > 0)"
-    if ($tokLen2 -le 0) { throw 'token lost after re-login' }
-
-    Write-Host '=== Phase C: M7c game panel (fake server.jar) ==='
     $javaSrc = @'
 import java.io.*;
 import java.net.*;
@@ -223,7 +221,7 @@ public class FakeMcServer {
     & $jarExe cfe "$tmp\server.jar" FakeMcServer -C "$tmp" FakeMcServer.class; if ($LASTEXITCODE -ne 0) { throw 'jar fake server' }
     Write-Host "  fake server.jar compiled"
 
-    $game = Start-Proc .\bin\gui.exe @('-config',"$tmp\acct.json",'-keyfile',"$tmp\acct.key",'-account','host','-game-start',"$tmp\server.jar",'-vnic=false','-exit-after','30s') 'acct-game'
+    $game = Start-Proc .\bin\gui.exe @('-config',"$tmp\game.json",'-keyfile',"$tmp\host.key",'-game-start',"$tmp\server.jar",'-vnic=false','-exit-after','30s') 'acct-game'
     $gStart = Wait-Log "$tmp\acct-game.out" 'game: server started' 25
     Write-Host "  game: server started log: $gStart"
     if (-not $gStart) { throw 'dedicated server did not start' }
@@ -247,9 +245,9 @@ public class FakeMcServer {
     [void](Wait-ProcExit $game 45)
     Write-Host "  game GUI exited: $($game.HasExited) code=$($game.ExitCode)"
 
-    $acct3 = Get-Content "$tmp\acct.json" -Raw | ConvertFrom-Json
-    Write-Host "  cfg java persisted: $([bool]$acct3.java) ; cfg server_jar persisted: $([bool]$acct3.server_jar)"
-    if (-not $acct3.java -or -not $acct3.server_jar) { throw 'java/server_jar not persisted to config' }
+    $gameCfg = Get-Content "$tmp\game.json" -Raw | ConvertFrom-Json
+    Write-Host "  cfg java persisted: $([bool]$gameCfg.java) ; cfg server_jar persisted: $([bool]$gameCfg.server_jar)"
+    if (-not $gameCfg.java -or -not $gameCfg.server_jar) { throw 'java/server_jar not persisted to config' }
 
     $portDown = -not (Test-TcpPort 25565)
     Write-Host "  port 25565 closed after exit: $portDown"

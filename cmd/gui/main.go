@@ -2,9 +2,9 @@
 
 // Command gui is the Eliauk VPN Windows application: a foolproof main window
 // (WebView2 / Edge Chromium) with a resident tray icon. A non-technical user can
-// double-click the exe, fill in a nickname and server address, paste friends'
-// codes, and play — no command-line flags needed. Settings and friends persist
-// to %AppData%\Eliauk\config.json; the X25519 identity stays in its own keyfile.
+// double-click the exe, fill in a nickname and server address, and play — no
+// command-line flags needed. Settings persist to %AppData%\Eliauk\config.json;
+// the X25519 identity stays in its own keyfile.
 //
 // It wraps the same headless agent as cmd/client (internal/agent); this file
 // only orchestrates config <-> agent <-> window/tray and the auto-reconnect
@@ -15,9 +15,12 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +29,9 @@ import (
 
 	"eliaukvpn/internal/agent"
 	"eliaukvpn/internal/config"
-	"eliaukvpn/internal/crypto"
 	"eliaukvpn/internal/mc"
-	"eliaukvpn/internal/p2p"
-	"eliaukvpn/internal/protocol"
 	"eliaukvpn/internal/tray"
+	"eliaukvpn/internal/update"
 	"eliaukvpn/internal/webviewhost"
 	"eliaukvpn/internal/winutil"
 )
@@ -72,10 +73,10 @@ func run() error {
 		keyfile       = flag.String("keyfile", agent.DefaultKeyfile(), "path to the X25519 identity key")
 		noElevate     = flag.Bool("no-elevate", false, "skip the UAC elevation prompt (virtual NIC will be unavailable)")
 		exitAfter     = flag.Duration("exit-after", 0, "automation hook: quit after this long (0 = run until quit)")
-		accountFlag   = flag.String("account", "", "M7 account to log in as (automation hook; needs -password)")
-		passwordFlag  = flag.String("password", "", "password for -account")
-		createFlag    = flag.Bool("create-account", false, "register -account instead of logging in")
 		gameStartJar  = flag.String("game-start", "", "automation hook: start the dedicated server with this jar after registering (e2e)")
+		createRoom    = flag.Bool("create-room", false, "automation hook: create a room after registering and log its code (e2e)")
+		joinRoom      = flag.String("join-room", "", "automation hook: join this room code after registering (e2e)")
+		updateCheck   = flag.String("update-check", "", "automation hook: run the self-update check against this feed and log the result (e2e)")
 		versionFlag   = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
@@ -89,6 +90,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Remove update artifacts left by an interrupted self-update (the install
+	// bat deletes itself and the downloaded exe on success, so anything that
+	// remains is orphaned).
+	update.CleanupStale()
 	// Flags override config (useful for testing); otherwise the config rules.
 	if *name != "" {
 		cfg.Name = *name
@@ -100,13 +105,6 @@ func run() error {
 	// the app can connect immediately (the user only needs to pick a nickname).
 	if cfg.Server == "" {
 		cfg.Server = defaultServer
-	}
-
-	// Load the identity up front so the friend code shows even before the
-	// first connection; the agent reuses the same keyfile.
-	identity, err := crypto.LoadOrCreate(*keyfile)
-	if err != nil {
-		return fmt.Errorf("load identity: %w", err)
 	}
 
 	if *useVnic && !winutil.IsElevated() && !*noElevate {
@@ -123,7 +121,6 @@ func run() error {
 	a := &app{
 		cfgPath:   *configPath,
 		cfg:       cfg,
-		myCode:    identity.Fingerprint(),
 		restartCh: make(chan struct{}, 1),
 		quitCh:    make(chan struct{}),
 		opts: options{
@@ -157,25 +154,6 @@ func run() error {
 		a.mcGameDir = mc.GameDir()
 	}
 	log.Printf("game: java=%q server-jar=%q launcher=%q gamedir=%q", a.mcJava, a.mcJar, a.mcLauncher, a.mcGameDir)
-
-	// Automation hook: log in / register an account on startup (used by the e2e
-	// script). The plaintext password lives only in a.pendingPass and is never
-	// written to the config; the fresh session token is cached after login.
-	if *accountFlag != "" {
-		if *passwordFlag != "" || *createFlag {
-			// Explicit password login / registration: clear any stale token so
-			// the server validates the password.
-			a.cfg.Account = *accountFlag
-			a.cfg.Token = ""
-			a.pendingUser = *accountFlag
-			a.pendingPass = *passwordFlag
-			a.pendingCreate = *createFlag
-		} else {
-			// No password: keep the cached session token (if any) and just point
-			// the account at the given name.
-			a.cfg.Account = *accountFlag
-		}
-	}
 
 	// Create the WebView2 host on a dedicated, LockOSThread'd goroutine; the
 	// window is created synchronously inside Run before it pumps messages.
@@ -225,6 +203,22 @@ func run() error {
 	if *gameStartJar != "" {
 		go a.autoStartGame(*gameStartJar)
 	}
+	if *createRoom {
+		go a.autoCreateRoom()
+	}
+	if *joinRoom != "" {
+		go a.autoJoinRoom(*joinRoom)
+	}
+	if *updateCheck != "" {
+		go func() {
+			// Wait for the frontend so state pushes render, then run one check.
+			time.Sleep(2 * time.Second)
+			a.mu.Lock()
+			a.cfg.UpdateURL = *updateCheck
+			a.mu.Unlock()
+			a.checkUpdate()
+		}()
+	}
 	go a.agentLoop()
 	go a.tickLoop()
 
@@ -266,6 +260,9 @@ func run() error {
 				}
 				tr.Delete()
 			}
+			// Apply a staged update last: spawn the detached swap script, then
+			// exit immediately so the old exe is free for overwriting.
+			a.installPendingUpdate()
 			return nil
 		}
 	}
@@ -285,7 +282,6 @@ type app struct {
 	cfgPath string
 	cfg     *config.Config
 	opts    options
-	myCode  string
 
 	ui        *webviewhost.Host
 	tr        *tray.Tray
@@ -300,13 +296,6 @@ type app struct {
 	noteGood bool
 	noteAt   time.Time
 
-	// M7: the login attempt currently in flight. pendingUser non-empty means the
-	// agent is trying to authenticate as that account; the password is kept only
-	// in memory (never persisted) until the server issues a session token.
-	pendingUser   string
-	pendingPass   string
-	pendingCreate bool
-
 	// M7c game panel: remembered Java / server.jar paths, the running dedicated
 	// server process, and a short tail of its output (all under mu).
 	mcJava     string
@@ -315,6 +304,14 @@ type app struct {
 	mcGameDir  string
 	mcSrv      *mc.Server
 	mcTail     []string
+
+	// Self-update state (under mu): a downloaded new exe awaiting install on
+	// the next quit, plus the About-panel status/version/notes.
+	updStatus  string
+	updVersion string
+	updNotes   string
+	updReady   bool
+	updExe     string // temp path of the downloaded new exe; "" = none pending
 
 	quitOnce sync.Once
 }
@@ -365,10 +362,9 @@ func (a *app) signalRestart() {
 func (a *app) agentLoop() {
 	for {
 		a.mu.Lock()
-		// The agent starts when a server is set and there's a display name OR an
-		// account to identify as (an empty name falls back to the account name
-		// inside the agent). Legacy (no-account) mode still needs a nickname.
-		hasCfg := a.cfg.Server != "" && (a.cfg.Name != "" || a.cfg.Account != "")
+		// The agent starts when a server is set and there's a display name to
+		// identify as (the name is how peers and room members see you).
+		hasCfg := a.cfg.Server != "" && a.cfg.Name != ""
 		a.mu.Unlock()
 
 		if !hasCfg {
@@ -411,34 +407,9 @@ func (a *app) agentLoop() {
 		a.mu.Unlock()
 		cancel()
 
-		// Inspect the live agent BEFORE closing it: Status() still holds the
-		// last server error, which distinguishes an auth rejection from a
-		// network drop.
-		st := ag.Status()
-		rejected := err != nil && !st.Registered && st.LastErr != ""
 		ag.Close()
 
-		if rejected {
-			a.mu.Lock()
-			pending := a.pendingUser
-			a.mu.Unlock()
-			if pending != "" {
-				// The account/password (or register) was refused. Stop retrying
-				// and drop back to the logged-out state so the user can fix it.
-				a.setNote("登录失败："+st.LastErr, false)
-				a.mu.Lock()
-				a.pendingUser, a.pendingPass, a.pendingCreate = "", "", false
-				a.cfg.Account, a.cfg.Token = "", ""
-				a.mu.Unlock()
-			} else {
-				// A cached session token no longer works (revoked or rotated).
-				a.setNote("登录状态已失效，请重新登录", false)
-				a.mu.Lock()
-				a.cfg.Account, a.cfg.Token = "", ""
-				a.mu.Unlock()
-			}
-			_ = a.cfg.Save(a.cfgPath)
-		} else if err != nil {
+		if err != nil {
 			a.setNote("连接中断，正在重连…", false)
 		}
 		select {
@@ -452,15 +423,8 @@ func (a *app) agentLoop() {
 func (a *app) agentOptions() agent.Options {
 	a.mu.Lock()
 	cfg := *a.cfg
-	pass, create := a.pendingPass, a.pendingCreate
 	a.mu.Unlock()
 
-	var keys [][]byte
-	for _, f := range cfg.Friends {
-		if raw, err := crypto.ParseFingerprint(f.Code); err == nil {
-			keys = append(keys, raw)
-		}
-	}
 	return agent.Options{
 		Name:          cfg.Name,
 		Server:        cfg.Server,
@@ -472,28 +436,19 @@ func (a *app) agentOptions() agent.Options {
 		LanEmu:        a.opts.lanEmu,
 		DebugPackets:  a.opts.debugPackets,
 		Keyfile:       a.opts.keyfile,
-		Friends:       keys,
-		// M7 credentials. A fresh login/registration carries the plaintext
-		// password (cfg.Token is cleared so the server validates it); after a
-		// session token has been cached, later restarts authenticate with it.
-		Account:  cfg.Account,
-		Password: pass,
-		Token:    cfg.Token,
-		Create:   create,
-		Info:     log.Printf,
-		Logf:     log.Printf,
+		Info:          log.Printf,
+		Logf:          log.Printf,
 	}
 }
 
 // tickLoop repaints the window once a second (once the frontend has signalled
-// ready) and persists any fresh session token.
+// ready).
 func (a *app) tickLoop() {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
 		select {
 		case <-tick.C:
-			a.maybePersistToken()
 			trTooltip(a)
 			a.mu.Lock()
 			ready := a.uiReady
@@ -507,42 +462,9 @@ func (a *app) tickLoop() {
 	}
 }
 
-// maybePersistToken caches the session token so the next start can log in
-// without a password. The server rotates the token on every successful login,
-// so even a token-based login produces a fresh token that must be persisted (the
-// old cached one is already invalid server-side). The plaintext password is
-// never written to disk: once the server has handed out a token, the pending
-// password is forgotten.
-func (a *app) maybePersistToken() {
-	a.mu.Lock()
-	ag := a.ag
-	acct := a.cfg.Account
-	cached := a.cfg.Token
-	a.mu.Unlock()
-	if ag == nil || acct == "" {
-		return
-	}
-	if ag.Account() != acct || ag.Token() == "" {
-		return
-	}
-	fresh := ag.Token()
-	if fresh == cached {
-		return
-	}
-	a.mu.Lock()
-	a.cfg.Token = fresh
-	a.pendingUser, a.pendingPass, a.pendingCreate = "", "", false
-	a.mu.Unlock()
-	if err := a.cfg.Save(a.cfgPath); err != nil {
-		a.setNote("保存登录状态失败："+err.Error(), false)
-	}
-}
-
 // state snapshots the current agent/config state into the frontend's renderable
-// model. When logged in to an M7 account the friend list mirrors the server-side
-// directory (card key ↔ KeyFP, sorted by username); in legacy mode it mirrors
-// cfg.Friends (card key ↔ Code). The delete button's card key maps straight back
-// to whichever list state() rendered.
+// model. Room membership is the single connectivity gate: same-room peers become
+// visible and reachable automatically.
 func (a *app) state() webviewhost.State {
 	a.mu.Lock()
 	cfg := *a.cfg
@@ -553,25 +475,18 @@ func (a *app) state() webviewhost.State {
 	s := webviewhost.State{
 		Fullscreen: a.ui.Fullscreen(),
 		Version:    version,
-		Code:       a.myCode,
-		Settings:   webviewhost.Settings{Name: cfg.Name, Server: cfg.Server},
+		Settings:   webviewhost.Settings{Name: cfg.Name, Server: cfg.Server, UpdateURL: cfg.UpdateURL},
 	}
 
 	var st agent.Status
-	acct := ""
 	if ag != nil {
 		st = ag.Status()
-		// Registered gates "logged in": myAccount is set at construction, so a
-		// rejected login would otherwise look logged-in before the server reply.
-		if st.Registered && st.Account != "" {
-			acct = st.Account
-		}
 	}
 
 	switch {
 	case note != "" && time.Since(noteAt) < 4*time.Second:
 		s.Status = webviewhost.StatusInfo{Text: note, Good: noteGood}
-	case cfg.Name == "" && cfg.Account == "":
+	case cfg.Name == "":
 		s.Status = webviewhost.StatusInfo{Text: "请先填写昵称，然后点“保存并连接”"}
 	case cfg.Server == "":
 		s.Status = webviewhost.StatusInfo{Text: "请先填写服务器地址，然后点“保存并连接”"}
@@ -582,25 +497,13 @@ func (a *app) state() webviewhost.State {
 		case st.VnicMsg != "":
 			s.Status = webviewhost.StatusInfo{Text: "虚拟网卡不可用：" + st.VnicMsg}
 		case st.Registered:
-			name := st.Name
-			if name == "" && acct != "" {
-				name = acct
-			}
-			s.Status = webviewhost.StatusInfo{Text: fmt.Sprintf("已连接 · %s · 虚拟IP %s", name, st.VirtualIP), Good: true}
+			s.Status = webviewhost.StatusInfo{Text: fmt.Sprintf("已连接 · %s · 虚拟IP %s", st.Name, st.VirtualIP), Good: true}
 		default:
 			s.Status = webviewhost.StatusInfo{Text: "连接中…"}
 		}
 	}
 	s.Status.Dot = statusDot(s.Status)
 
-	// M7 account / room / hint lines.
-	s.Account = acct
-	s.LoggedIn = acct != ""
-	if acct != "" {
-		s.AddHint = "输入对方的用户名（账号）即可添加"
-	} else {
-		s.AddHint = "未登录：可粘贴好友码连接；登录后可按用户名加好友"
-	}
 	if ag != nil {
 		if room := ag.RoomState(); room != nil {
 			s.Room.In = true
@@ -624,6 +527,17 @@ func (a *app) state() webviewhost.State {
 	gameRunning := a.mcSrv != nil && a.mcSrv.Running()
 	a.mu.Unlock()
 	s.Game.Running = gameRunning
+
+	// Self-update status for the About panel.
+	a.mu.Lock()
+	s.Update = webviewhost.UpdateInfo{
+		Status:  a.updStatus,
+		Ready:   a.updReady,
+		Version: a.updVersion,
+		Notes:   a.updNotes,
+	}
+	a.mu.Unlock()
+
 	if addr := a.joinableAddr(); addr != "" {
 		s.Game.Addr = addr
 		if gameRunning {
@@ -637,16 +551,6 @@ func (a *app) state() webviewhost.State {
 		s.Game.State = "未运行"
 	}
 
-	online, conn := peerState(ag)
-	if acct != "" {
-		for _, f := range ag.FriendDirectory() {
-			s.Friends = append(s.Friends, accountFriendCard(f, conn))
-		}
-	} else {
-		for _, f := range cfg.Friends {
-			s.Friends = append(s.Friends, friendCard(f, online, conn))
-		}
-	}
 	return s
 }
 
@@ -673,85 +577,18 @@ func trTooltip(a *app) {
 	cfg := *a.cfg
 	a.mu.Unlock()
 	switch {
-	case cfg.Server == "" || (cfg.Name == "" && cfg.Account == ""):
+	case cfg.Server == "" || cfg.Name == "":
 		a.tr.SetTooltip("Eliauk VPN — 未连接")
 	case ag == nil:
 		a.tr.SetTooltip("Eliauk VPN — 连接中…")
 	default:
 		st := ag.Status()
 		if st.Registered {
-			name := st.Name
-			if name == "" && st.Account != "" {
-				name = st.Account
-			}
-			a.tr.SetTooltip(fmt.Sprintf("Eliauk VPN — %s (%s)", name, st.VirtualIP))
+			a.tr.SetTooltip(fmt.Sprintf("Eliauk VPN — %s (%s)", st.Name, st.VirtualIP))
 		} else {
 			a.tr.SetTooltip("Eliauk VPN — 连接中…")
 		}
 	}
-}
-
-// peerState maps (lowercased) peer names to their online status and tunnel
-// connection state.
-func peerState(ag *agent.Agent) (online map[string]bool, conn map[string]p2p.State) {
-	online = make(map[string]bool)
-	conn = make(map[string]p2p.State)
-	if ag == nil {
-		return online, conn
-	}
-	for _, p := range ag.Peers() {
-		online[strings.ToLower(p.Name)] = true
-	}
-	for _, s := range ag.Snapshot() {
-		k := strings.ToLower(s.Name)
-		online[k] = true
-		conn[k] = s.State
-	}
-	return online, conn
-}
-
-// accountFriendCard renders one M7 account-directory friend. Presence comes from
-// the server (f.Online); the tunnel state overlays a stronger claim when a P2P
-// connection is actually up or in progress. The card key is the stable KeyFP.
-func accountFriendCard(f protocol.Friend, conn map[string]p2p.State) webviewhost.FriendCard {
-	c := webviewhost.FriendCard{Key: f.KeyFP, Name: f.Username, Online: f.Online}
-	switch conn[strings.ToLower(f.Username)] {
-	case p2p.StateConnected:
-		c.State = "connected"
-	case p2p.StateConnecting:
-		c.State = "connecting"
-	default:
-		if f.Online {
-			c.State = "online"
-		} else {
-			c.State = "offline"
-		}
-	}
-	return c
-}
-
-// friendCard renders one legacy friend with its live state. The card key is the
-// friend's fingerprint code.
-func friendCard(f config.Friend, online map[string]bool, conn map[string]p2p.State) webviewhost.FriendCard {
-	name := strings.TrimSpace(f.Name)
-	if name == "" {
-		name = "(未命名)"
-	}
-	key := strings.ToLower(strings.TrimSpace(f.Name))
-	c := webviewhost.FriendCard{Key: f.Code, Name: name}
-	switch conn[key] {
-	case p2p.StateConnected:
-		c.State = "connected"
-	case p2p.StateConnecting:
-		c.State = "connecting"
-	default:
-		if online[key] {
-			c.State = "online"
-		} else {
-			c.State = "offline"
-		}
-	}
-	return c
 }
 
 // handleAction applies one frontend action to config and the live agent.
@@ -766,20 +603,14 @@ func (a *app) handleAction(act webviewhost.Action) {
 	case webviewhost.ActCopy:
 		winutil.CopyToClipboard(a.ui.Window(), act.Text)
 		a.setNote("已复制到剪贴板", true)
-	case webviewhost.ActAddFriend:
-		a.addFriend(act.Input)
-	case webviewhost.ActDeleteFriend:
-		a.deleteFriend(act.Key)
 	case webviewhost.ActSave:
-		a.saveSettings(act.Name, act.Server)
+		a.saveSettings(act.Name, act.Server, act.UpdateURL)
 	case webviewhost.ActQuit:
 		a.quit()
-	case webviewhost.ActLogin:
-		a.doAuth(act.User, act.Pass, false)
-	case webviewhost.ActRegister:
-		a.doAuth(act.User, act.Pass, true)
-	case webviewhost.ActLogout:
-		a.logout()
+	case webviewhost.ActCheckUpdate:
+		go a.checkUpdate()
+	case webviewhost.ActApplyUpdate:
+		a.quit()
 	case webviewhost.ActRoomCreate:
 		a.roomAction(func(ag *agent.Agent) error { return ag.CreateRoom() }, "已创建房间", true)
 	case webviewhost.ActRoomJoin:
@@ -800,155 +631,6 @@ func (a *app) handleAction(act webviewhost.Action) {
 		a.ui.ToggleFullscreen()
 		a.ui.Push(a.state())
 	}
-}
-
-// addFriend adds a peer: by username when logged in to an M7 account (the
-// server resolves it and makes the friendship symmetric), or by pasted friend
-// fingerprint in legacy mode. Either way the live agent's whitelist updates.
-func (a *app) addFriend(input string) {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		a.setNote("请输入对方的用户名", false)
-		return
-	}
-	a.mu.Lock()
-	ag := a.ag
-	acct := loggedInAccount(ag)
-	a.mu.Unlock()
-	if acct != "" {
-		if err := ag.AddFriendByName(input); err != nil {
-			a.setNote(err.Error(), false)
-			return
-		}
-		a.setNote("已添加好友："+input, true)
-		return
-	}
-	// Legacy fingerprint mode (not logged in).
-	if _, err := crypto.ParseFingerprint(input); err != nil {
-		a.setNote("未登录且输入的不是有效好友码："+err.Error(), false)
-		return
-	}
-	a.mu.Lock()
-	added := a.cfg.AddFriend("", input)
-	a.mu.Unlock()
-	if !added {
-		a.setNote("这个好友码已经在列表里了", false)
-		return
-	}
-	if err := a.cfg.Save(a.cfgPath); err != nil {
-		a.setNote("保存配置失败："+err.Error(), false)
-		return
-	}
-	if ag != nil {
-		_ = ag.AddFriend(input)
-	}
-	a.setNote("已添加好友", true)
-}
-
-// deleteFriend removes the friend identified by the stable card key. The key
-// source matches state(): KeyFP (account directory) or Code (legacy config).
-func (a *app) deleteFriend(key string) {
-	a.mu.Lock()
-	ag := a.ag
-	acct := loggedInAccount(ag)
-	a.mu.Unlock()
-	if acct != "" {
-		if ag == nil {
-			return
-		}
-		// Resolve the KeyFP back to its username (the directory is what the
-		// server removes by name).
-		var uname string
-		for _, f := range ag.FriendDirectory() {
-			if f.KeyFP == key {
-				uname = f.Username
-				break
-			}
-		}
-		if uname == "" {
-			uname = key // defensive: treat the key as the username directly
-		}
-		if err := ag.RemoveFriendByName(uname); err != nil {
-			a.setNote(err.Error(), false)
-			return
-		}
-		a.setNote("已删除好友", true)
-		return
-	}
-	// Legacy fingerprint mode: key IS the friend's code.
-	a.mu.Lock()
-	a.cfg.RemoveFriend(key)
-	a.mu.Unlock()
-	if err := a.cfg.Save(a.cfgPath); err != nil {
-		a.setNote("保存配置失败："+err.Error(), false)
-		return
-	}
-	if ag != nil {
-		_ = ag.RemoveFriend(key)
-	}
-	a.setNote("已删除好友", true)
-}
-
-// loggedInAccount returns the authenticated username of ag, or "" when the
-// agent is not connected or the account is still pending.
-func loggedInAccount(ag *agent.Agent) string {
-	if ag == nil {
-		return ""
-	}
-	st := ag.Status()
-	if st.Registered && st.Account != "" {
-		return st.Account
-	}
-	return ""
-}
-
-// doAuth logs in (create=false) or registers (create=true) an account. It sets
-// the pending credentials, clears any stale session token, and rebuilds the
-// agent so it re-registers with the server.
-func (a *app) doAuth(user, pass string, create bool) {
-	user = strings.TrimSpace(user)
-	if user == "" || pass == "" {
-		a.setNote("账号和密码都不能为空", false)
-		return
-	}
-	// A fresh install has no nickname yet; the account username doubles as the
-	// display name (the agent does the same fallback) so registering/logging in
-	// works without a separate 设置 step.
-	a.mu.Lock()
-	if a.cfg.Name == "" {
-		a.cfg.Name = user
-	}
-	server := a.cfg.Server
-	a.mu.Unlock()
-	if server == "" {
-		a.setNote("请先在「设置」填写服务器地址并点“保存并连接”", false)
-		return
-	}
-	a.mu.Lock()
-	a.pendingUser, a.pendingPass, a.pendingCreate = user, pass, create
-	a.cfg.Account = user
-	a.cfg.Token = "" // force a password-based (re)authentication
-	a.mu.Unlock()
-	a.signalRestart()
-	if create {
-		a.setNote("正在注册…", true)
-	} else {
-		a.setNote("正在登录…", true)
-	}
-}
-
-// logout clears the cached account/token and reconnects anonymously.
-func (a *app) logout() {
-	a.mu.Lock()
-	a.pendingUser, a.pendingPass, a.pendingCreate = "", "", false
-	a.cfg.Account, a.cfg.Token = "", ""
-	a.mu.Unlock()
-	if err := a.cfg.Save(a.cfgPath); err != nil {
-		a.setNote("保存配置失败："+err.Error(), false)
-		return
-	}
-	a.signalRestart()
-	a.setNote("已退出登录", true)
 }
 
 // roomAction runs one room operation on the live agent and reports the result.
@@ -1010,7 +692,8 @@ func (a *app) gameLogf() func(string) {
 
 // autoStartGame is the -game-start automation hook: once the agent is
 // registered, start the dedicated server with the given jar and the auto-
-// detected (or configured) Java. Bound so a failed login can't hang the e2e.
+// detected (or configured) Java. Bound so a failed registration can't hang the
+// e2e.
 func (a *app) autoStartGame(jar string) {
 	deadline := time.Now().Add(40 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1024,6 +707,56 @@ func (a *app) autoStartGame(jar string) {
 		time.Sleep(300 * time.Millisecond)
 	}
 	log.Printf("game: auto-start aborted: agent not registered within 40s")
+}
+
+// autoCreateRoom is the -create-room automation hook: once the agent is
+// registered, create a room and log its code so the e2e can hand it to a second
+// instance to join.
+func (a *app) autoCreateRoom() {
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		ag := a.ag
+		a.mu.Unlock()
+		if ag != nil && ag.Status().Registered {
+			if err := ag.CreateRoom(); err != nil {
+				log.Printf("room: create failed: %v", err)
+				return
+			}
+			for time.Now().Before(deadline) {
+				if r := ag.RoomState(); r != nil && r.Code != "" {
+					log.Printf("room: created code=%s", r.Code)
+					return
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			log.Printf("room: created but no code within deadline")
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	log.Printf("room: auto-create aborted: agent not registered within 40s")
+}
+
+// autoJoinRoom is the -join-room automation hook: once the agent is registered,
+// join the given room code so the e2e can pair two instances.
+func (a *app) autoJoinRoom(code string) {
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		ag := a.ag
+		a.mu.Unlock()
+		if ag != nil && ag.Status().Registered {
+			if err := ag.JoinRoom(code); err != nil {
+				log.Printf("room: join failed: %v", err)
+				return
+			}
+			log.Printf("room: join requested code=%s", code)
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	log.Printf("room: auto-join aborted: agent not registered within 40s")
 }
 
 // persistGamePaths remembers the last-used Java / server.jar so the next start
@@ -1168,21 +901,121 @@ func (a *app) launchGame(launcher string) {
 }
 
 // saveSettings persists the nickname/server and restarts the agent with them.
-func (a *app) saveSettings(name, server string) {
+func (a *app) saveSettings(name, server, updateURL string) {
 	name = strings.TrimSpace(name)
 	server = strings.TrimSpace(server)
+	updateURL = strings.TrimSpace(updateURL)
 	if name == "" || server == "" {
 		a.setNote("昵称和服务器地址都不能为空", false)
 		return
 	}
 	a.mu.Lock()
+	// Only the connectivity settings justify tearing down the agent; changing
+	// the update feed alone just persists.
+	restart := name != a.cfg.Name || server != a.cfg.Server
 	a.cfg.Name = name
 	a.cfg.Server = server
+	a.cfg.UpdateURL = updateURL
 	a.mu.Unlock()
 	if err := a.cfg.Save(a.cfgPath); err != nil {
 		a.setNote("保存配置失败："+err.Error(), false)
 		return
 	}
-	a.signalRestart()
-	a.setNote("已保存，正在连接…", true)
+	if restart {
+		a.signalRestart()
+		a.setNote("已保存，正在连接…", true)
+	} else {
+		a.setNote("已保存", true)
+	}
+}
+
+// checkUpdate runs the self-update flow off the UI thread: fetch the manifest,
+// verify its signature, download and SHA-256-verify the new exe, then stage it
+// for install at the next quit. Every stage pushes state so the About panel
+// reflects progress.
+func (a *app) checkUpdate() {
+	a.setUpdate("", "", "正在检查更新…", false, "")
+	a.pushState()
+
+	a.mu.Lock()
+	feed := a.cfg.UpdateURL
+	a.mu.Unlock()
+	if feed == "" {
+		a.setUpdate("", "", "未配置更新源（在设置里填写更新源地址）", false, "")
+		a.pushState()
+		return
+	}
+
+	m, err := update.Check(feed, nil)
+	if err != nil {
+		log.Printf("update: check failed: %v", err)
+		a.setUpdate("", "", "检查更新失败："+err.Error(), false, "")
+		a.pushState()
+		return
+	}
+	if err := update.Verify(m, updatePublicKey()); err != nil {
+		log.Printf("update: verify failed: %v", err)
+		a.setUpdate("", "", "检查更新失败："+err.Error(), false, "")
+		a.pushState()
+		return
+	}
+	if !update.Newer(m.Version, version) {
+		a.setUpdate("", "", "已是最新版本 v"+version, false, "")
+		a.pushState()
+		return
+	}
+
+	a.setUpdate("", m.Version, "正在下载 v"+m.Version+" …", false, m.Notes)
+	a.pushState()
+	exe, err := update.Download(m, nil)
+	if err != nil {
+		log.Printf("update: download failed: %v", err)
+		a.setUpdate("", m.Version, "下载失败："+err.Error(), false, "")
+		a.pushState()
+		return
+	}
+	a.setUpdate(exe, m.Version, "已下载 v"+m.Version+"，退出时自动安装", true, m.Notes)
+	a.pushState()
+	log.Printf("update: staged v%s (%s)", m.Version, exe)
+}
+
+// installPendingUpdate arms the delayed swap for a staged download. Called at
+// the very end of run(), after teardown, so the old exe is free for the bat to
+// overwrite the instant this process exits.
+func (a *app) installPendingUpdate() {
+	a.mu.Lock()
+	exe := a.updExe
+	a.mu.Unlock()
+	if exe == "" {
+		return
+	}
+	cur, err := os.Executable()
+	if err != nil {
+		log.Printf("update: resolve current exe: %v", err)
+		return
+	}
+	log.Printf("update: installing %s over %s at exit", exe, cur)
+	if err := update.Install(exe, cur); err != nil {
+		log.Printf("update: install failed: %v", err)
+	}
+}
+
+func (a *app) setUpdate(exe, ver, status string, ready bool, notes string) {
+	a.mu.Lock()
+	a.updExe, a.updVersion, a.updStatus, a.updReady, a.updNotes = exe, ver, status, ready, notes
+	a.mu.Unlock()
+}
+
+func (a *app) pushState() {
+	a.ui.Push(a.state())
+}
+
+// updatePublicKey decodes the baked-in Ed25519 release key. A blank or invalid
+// key returns nil, which makes update.Verify fall back to SHA-256 only.
+func updatePublicKey() ed25519.PublicKey {
+	raw, err := hex.DecodeString(update.UpdatePubKey)
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		return nil
+	}
+	return ed25519.PublicKey(raw)
 }

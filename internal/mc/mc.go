@@ -68,8 +68,10 @@ var pclExeNames = []string{
 }
 
 // FindPCL locates a Plain Craft Launcher executable in the places a portable
-// launcher usually lives (Desktop / Downloads / Documents, then Program Files).
-// The search is shallow (depth-limited) so it stays fast.
+// launcher usually lives (Desktop / Downloads / Documents). Only the user's own
+// folders are searched: PCL is a portable exe, never an installed Program Files
+// app, and sweeping %LocalAppData% costs seconds per GUI launch (or loops
+// forever on a junction cycle) for zero realistic gain.
 func FindPCL() string {
 	var dirs []string
 	if home := os.Getenv("USERPROFILE"); home != "" {
@@ -78,11 +80,6 @@ func FindPCL() string {
 			filepath.Join(home, "Downloads"),
 			filepath.Join(home, "Documents"),
 		)
-	}
-	for _, v := range []string{"ProgramFiles", "ProgramFiles(x86)", "LocalAppData"} {
-		if r := os.Getenv(v); r != "" {
-			dirs = append(dirs, r)
-		}
 	}
 	for _, d := range dirs {
 		if p := findExeNamed(d, pclExeNames); p != "" {
@@ -94,35 +91,69 @@ func FindPCL() string {
 
 // findExeNamed walks root (depth-limited) looking for a file whose name matches
 // any of names (case-insensitive). It returns "" when nothing matches.
+//
+// The scan is a manual breadth-first descent with os.ReadDir rather than
+// filepath.Walk: each directory is resolved with EvalSymlinks and only entered
+// once, so a junction/symlink cycle (common under the profile folders on
+// Windows) can never loop forever, and a fixed entry budget keeps even a huge
+// or unresponsive tree from stalling startup for seconds.
 func findExeNamed(root string, names []string) string {
 	if !isDir(root) {
 		return ""
 	}
-	var found string
-	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	const (
+		maxDepth   = 3
+		maxEntries = 5000
+	)
+	seen := map[string]bool{}
+	if res, err := filepath.EvalSymlinks(root); err == nil {
+		seen[filepath.Clean(res)] = true
+	}
+	type node struct {
+		dir   string
+		depth int
+	}
+	var visited int
+	stack := []node{{root, 0}}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		n := stack[last]
+		stack = stack[:last]
+		entries, err := os.ReadDir(n.dir)
 		if err != nil {
-			return nil
+			continue
 		}
-		if found != "" {
-			return filepath.SkipAll
-		}
-		if rel, e := filepath.Rel(root, path); e == nil && rel != "." && strings.Count(rel, string(os.PathSeparator)) > 3 {
-			if info.IsDir() {
-				return filepath.SkipDir
+		for _, e := range entries {
+			visited++
+			if visited > maxEntries {
+				return ""
 			}
-			return nil
-		}
-		if !info.IsDir() {
-			for _, n := range names {
-				if strings.EqualFold(info.Name(), n) {
-					found = path
-					return filepath.SkipAll
+			name := e.Name()
+			path := filepath.Join(n.dir, name)
+			if e.IsDir() {
+				if n.depth >= maxDepth {
+					continue
+				}
+				res, err := filepath.EvalSymlinks(path)
+				if err != nil {
+					continue // broken junction / unreadable; skip it
+				}
+				res = filepath.Clean(res)
+				if seen[res] {
+					continue // cycle: junction back to an already-scanned dir
+				}
+				seen[res] = true
+				stack = append(stack, node{path, n.depth + 1})
+				continue
+			}
+			for _, p := range names {
+				if strings.EqualFold(name, p) {
+					return path
 				}
 			}
 		}
-		return nil
-	})
-	return found
+	}
+	return ""
 }
 
 // LauncherPath returns the best launcher to start: PCL first (the launcher

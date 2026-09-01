@@ -19,19 +19,20 @@ const (
 	firstClientIP  = 2
 )
 
-// Client is one connected peer in the virtual network. M7 accounts bind a
-// client to an Account (Account holds the username; KeyFP is the fingerprint
-// the P2P whitelist keys on).
+// Client is one connected peer in the virtual network. KeyFP is the client's
+// base64 X25519 fingerprint — the stable identity that rooms and the P2P
+// whitelist key on (the random ID changes every connection, the fingerprint
+// does not).
 type Client struct {
 	ID         string
 	Name       string
-	Account    string // "" for legacy anonymous clients
-	KeyFP      string // base64 X25519 fingerprint (M7)
+	KeyFP      string // base64 X25519 fingerprint
 	VirtualIP  string
 	PublicIP   string
 	PublicPort int
 	NATType    string
 	Candidates []protocol.Candidate
+	Seq        int64 // registration order; the room-host successor is the oldest
 	Conn       *websocket.Conn
 	writeMu    sync.Mutex // serializes writes so broadcasts don't interleave
 }
@@ -40,21 +41,20 @@ type Client struct {
 type Registry struct {
 	mu        sync.Mutex
 	clients   map[string]*Client
-	byAccount map[string]*Client // account username -> client (online accounts only)
+	byFP      map[string]*Client  // fingerprint -> client (online clients only)
 	nextIP    int
 	relayAddr map[string]*net.UDPAddr // client id -> address it relays from
+	seq       int64                   // monotonically increasing registration counter
 
-	rooms  map[string]*Room    // room code -> room
-	inRoom map[string]string   // account username -> room code
-
-	isFriend func(user, friend string) bool // account friend graph (M7)
+	rooms  map[string]*Room  // room code -> room
+	inRoom map[string]string // fingerprint -> room code
 }
 
 // NewRegistry creates an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		clients:   make(map[string]*Client),
-		byAccount: make(map[string]*Client),
+		byFP:      make(map[string]*Client),
 		nextIP:    firstClientIP,
 		relayAddr: make(map[string]*net.UDPAddr),
 		rooms:     make(map[string]*Room),
@@ -77,9 +77,9 @@ func (r *Registry) RelayAddr(id string) (*net.UDPAddr, bool) {
 	return a, ok
 }
 
-// Add registers a new client and assigns it a virtual IP. account and keyFP
-// are empty for legacy anonymous clients.
-func (r *Registry) Add(name, account, keyFP string, conn *websocket.Conn) (*Client, error) {
+// Add registers a new client and assigns it a virtual IP. keyFP is the client's
+// X25519 fingerprint — its stable identity for room membership.
+func (r *Registry) Add(name, keyFP string, conn *websocket.Conn) (*Client, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -91,36 +91,32 @@ func (r *Registry) Add(name, account, keyFP string, conn *websocket.Conn) (*Clie
 	if err != nil {
 		return nil, err
 	}
+	r.seq++
 	c := &Client{
 		ID:        id,
 		Name:      name,
-		Account:   account,
 		KeyFP:     keyFP,
 		VirtualIP: ip,
+		Seq:       r.seq,
 		Conn:      conn,
 	}
 	r.clients[id] = c
-	if account != "" {
-		r.byAccount[account] = c
+	if keyFP != "" {
+		r.byFP[keyFP] = c
 	}
 	return c, nil
 }
 
-// Remove deletes a client (e.g. on disconnect). It also drops the account from
-// any room; the caller is responsible for notifying the remaining members.
+// Remove deletes a client (e.g. on disconnect) and drops it from any room (with
+// host promotion if it was the host). The caller is responsible for notifying
+// the remaining members.
 func (r *Registry) Remove(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if c, ok := r.clients[id]; ok && c.Account != "" {
-		delete(r.byAccount, c.Account)
-		if code := r.inRoom[c.Account]; code != "" {
-			if room := r.rooms[code]; room != nil {
-				delete(room.Members, c.Account)
-				if len(room.Members) == 0 {
-					delete(r.rooms, code)
-				}
-			}
-			delete(r.inRoom, c.Account)
+	if c, ok := r.clients[id]; ok {
+		if c.KeyFP != "" {
+			delete(r.byFP, c.KeyFP)
+			r.removeFromRoomLocked(c.KeyFP)
 		}
 	}
 	delete(r.clients, id)
@@ -140,7 +136,7 @@ func (r *Registry) UpdateEndpoint(id, publicIP string, publicPort int, natType s
 }
 
 // Peers returns one protocol.Peer per connected client, excluding the given id
-// (legacy: everyone is visible). Account-aware callers use VisiblePeers.
+// (debug/dump endpoint; room-aware callers use VisiblePeers).
 func (r *Registry) Peers(excludeID string) []protocol.Peer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -158,63 +154,39 @@ func (r *Registry) peersAllLocked(excludeID string) []protocol.Peer {
 	return peers
 }
 
-// VisiblePeers is the M7 visibility rule: for account clients, only friends and
-// same-room members are visible (that is the entire P2P connectivity surface —
-// you can punch toward, and be discovered by, exactly the people you can see).
-// Legacy anonymous clients still see everyone (no friend check configured).
-func (r *Registry) VisiblePeers(excludeID, account string) []protocol.Peer {
+// VisiblePeers returns the peers a client can see: only the other members of
+// the room it is currently in. A room is the sole connectivity gate — with no
+// room, a client sees no one and no one can punch toward it. This is the entire
+// P2P connectivity surface.
+func (r *Registry) VisiblePeers(excludeID, keyFP string) []protocol.Peer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if account == "" || r.isFriend == nil {
-		return r.peersAllLocked(excludeID)
+	code := r.inRoom[keyFP]
+	if code == "" {
+		return nil
 	}
-	code := r.inRoom[account]
 	peers := make([]protocol.Peer, 0, len(r.clients))
 	for _, c := range r.clients {
-		if c.ID == excludeID || c.Account == account {
+		if c.ID == excludeID {
 			continue
 		}
-		if code != "" && r.inRoom[c.Account] == code {
-			peers = append(peers, peerOf(c))
-			continue
-		}
-		if r.isFriend(account, c.Account) {
+		if r.inRoom[c.KeyFP] == code {
 			peers = append(peers, peerOf(c))
 		}
 	}
 	return peers
 }
 
-// VisibleTo reports whether src may ask to connect to dst (friends or same
-// room). Legacy clients (no account) are visible to everyone.
+// VisibleTo reports whether src may ask to connect to dst: only when both are
+// in the same room.
 func (r *Registry) VisibleTo(src, dst *Client) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if src.Account == "" || dst.Account == "" || r.isFriend == nil {
-		return true
-	}
-	if src.Account == dst.Account {
+	if src.ID == dst.ID {
 		return false
 	}
-	if code := r.inRoom[src.Account]; code != "" && r.inRoom[dst.Account] == code {
-		return true
-	}
-	return r.isFriend(src.Account, dst.Account)
-}
-
-// SetFriendCheck installs the account friend-graph lookup used for visibility.
-func (r *Registry) SetFriendCheck(f func(user, friend string) bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.isFriend = f
-}
-
-// ClientByAccount returns the online client of an account (nil if offline).
-func (r *Registry) ClientByAccount(username string) (*Client, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	c, ok := r.byAccount[username]
-	return c, ok
+	code := r.inRoom[src.KeyFP]
+	return code != "" && r.inRoom[dst.KeyFP] == code
 }
 
 func peerOf(c *Client) protocol.Peer {
@@ -234,6 +206,15 @@ func (r *Registry) Client(id string) (*Client, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c, ok := r.clients[id]
+	return c, ok
+}
+
+// ClientByFP returns the online client with the given fingerprint (nil if
+// offline).
+func (r *Registry) ClientByFP(keyFP string) (*Client, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.byFP[keyFP]
 	return c, ok
 }
 

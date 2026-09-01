@@ -8,12 +8,10 @@
 
 ## ✨ 能做什么
 
-- **账号系统** —— 注册 / 登录，PBKDF2-HMAC-SHA256 密码哈希 + 会话 Token，设备指纹绑定。
-- **好友 & 在线状态** —— 按用户名互加好友，在线状态实时可见。
-- **房间一键加入** —— 创建房间拿 5 位房间码，朋友输入即自动互连（**无需互加好友**）。
+- **房间一键加入** —— 创建房间拿 5 位房间码，朋友输入即自动互连（**无需加好友**）。
 - **游戏启动器集成** —— 自动检测 Java / 服务器 jar，一键开服，自动把服务器写进 Minecraft 官方启动器多人在线列表。
 - **NAT 穿透** —— STUN 探测 + UDP 打洞直连；对称 NAT 打洞失败自动回退服务器中继。
-- **端到端加密** —— X25519 身份 + AES-256-GCM，好友白名单（非白名单 peer 双向拒收）。
+- **端到端加密** —— X25519 身份 + AES-256-GCM，房间成员白名单（非成员 peer 双向拒收）。
 - **异地组网** —— 配合 Cloudflare Tunnel，**无需公网 IP** 即可把信令暴露到固定域名（见下文）。
 
 ## 🏗 工作原理
@@ -31,7 +29,7 @@
      10.0.0.2       10.0.0.3      10.0.0.4
 ```
 
-- **协调服务器只做信令**：注册、好友、房间、交换打洞候选、分配虚拟 IP。它**不碰游戏流量**（除非打洞失败退化到中继）。
+- **协调服务器只做信令**：注册、房间、交换打洞候选、分配虚拟 IP。它**不碰游戏流量**（除非打洞失败退化到中继）。
 - 真正的游戏数据走两台机器之间的 **点对点 UDP 加密隧道**。
 - 每台机器装一块 **Wintun 虚拟网卡**（`10.0.0.x`），系统层面像在同一局域网；Minecraft 的 UDP 广播（4445 端口）由软件层模拟转发。
 
@@ -51,10 +49,9 @@ go build -ldflags "-H windowsgui" -o eliaukvpn.exe ./cmd/gui
 ### 1. 启动协调服务器
 
 ```powershell
-go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网IP>:9091 -accounts accounts.json
+go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网IP>:9091
 ```
 
-- `-accounts` 指向账号数据库文件（缺省则退回 legacy 匿名模式，账号/好友/房间不可用）。
 - 本机测试时 `relay-public` 用 `127.0.0.1:9091`。
 
 ### 2. 启动 GUI
@@ -62,9 +59,8 @@ go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网
 双击 `eliaukvpn.exe`（或 `go run ./cmd/gui`），主窗口里：
 
 1. 填「昵称」（服务器地址默认已填 `wss://vpn.kaelzfeng.uk/ws`，可改成你自己的）→ 「保存并连接」。
-2. 「账号」组注册 → 登录（Token 缓存到 config，重启免密）。
-3. 「好友」组按用户名加好友，或「房间」组创建房间 → 把 5 位房间码发给朋友加入。
-4. 「游戏」组一键开服 → 「复制地址」发给朋友 → 朋友「添加服务器」进 Minecraft 列表。
+2. 「房间」组创建房间 → 把 5 位房间码发给朋友 → 朋友在「房间」组输入房间码加入，即自动互连。
+3. 「游戏」组一键开服 → 「复制地址」发给朋友 → 朋友「添加服务器」进 Minecraft 列表。
 
 设置持久化在 `%AppData%\Eliauk\config.json`，身份在 `identity.key`。
 
@@ -107,7 +103,7 @@ GUI 服务器地址填 **`wss://vpn.<你的域名>/ws`**。
 
 ```
 cmd/
-  server/   # 协调服务器（WebSocket 信令 + 中继 + 账号/好友/房间）
+  server/   # 协调服务器（WebSocket 信令 + 中继 + 房间）
   gui/      # 傻瓜式主窗口 GUI（WebView2 / Edge Chromium，深色卡片主题）
   client/   # 交互式 CLI 客户端（调试用）
   mcprobe/  # 假 MC 服务端/客户端，测数据面
@@ -119,7 +115,7 @@ internal/
   tray/     # 纯 Win32 托盘
   p2p/      # UDP 打洞 + 加密隧道
   crypto/   # X25519 + HKDF + AES-256-GCM（stdlib）
-  server/   # 注册表 + 虚拟 IP + 账号/好友/房间
+  server/   # 注册表 + 虚拟 IP + 房间
   mc/       # Minecraft 集成（Java 检测、开服、servers.dat NBT 注入）
   lan/      # MC 局域网发现广播模拟
   stun/     # STUN 客户端 + NAT 类型检测
@@ -131,18 +127,17 @@ internal/
 
 ```powershell
 go test ./...
-powershell -File e2e-gui.ps1   # 三阶段 e2e：匿名 p2p + 账号/token + 游戏面板
+powershell -File e2e-gui.ps1   # 两阶段 e2e：房间 p2p + 游戏面板
 ```
 
 ## 🔒 安全
 
-- **身份**：X25519 长期密钥（`identity.key`），base64 指纹用于好友白名单。
+- **身份**：X25519 长期密钥（`identity.key`），base64 指纹用于房间成员白名单。
 - **会话**：三角色无关 DH（static↔eph、eph↔static、eph↔eph）+ HKDF 派生 AES-256-GCM 会话密钥，握手同时发起无 initiator/responder 之分。
-- **白名单**：只允许白名单内指纹建立会话；非白名单 peer 数据帧被丢弃（含不对称白名单的 drop-guard）。
-- **密码**：PBKDF2-HMAC-SHA256（100k 迭代），明文从不落盘；会话 Token 每次登录轮换。
+- **白名单**：只允许白名单内指纹建立会话；非白名单 peer 数据帧被丢弃（含不对称白名单的 drop-guard）。白名单 = 当前房间成员。
 
 ## 🗺 里程碑
 
-M0 文档 ✅ → M1 协调服务器/STUN ✅ → M2 打洞直连 ✅ → M3 中继回退 ✅ → M4 虚拟网卡 ✅ → M5 游戏链路（MC 局域网发现）✅ → M6 加密/白名单/托盘/主窗口 GUI ✅ → **M7 账号/好友/房间/启动器 ✅** → M9 跨机验证（待做）。
+M0 文档 ✅ → M1 协调服务器/STUN ✅ → M2 打洞直连 ✅ → M3 中继回退 ✅ → M4 虚拟网卡 ✅ → M5 游戏链路（MC 局域网发现）✅ → M6 加密/白名单/托盘/主窗口 GUI ✅ → **M7 房间/启动器 ✅**（账号/好友已移除，房间是唯一联机入口）→ M9 跨机验证（待做）。
 
 > 详细的开发记录、踩坑与交接文档见 [`handoff.md`](handoff.md)。

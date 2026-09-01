@@ -12,14 +12,6 @@ type StatusInfo struct {
 	Dot  string `json:"dot"` // ok | warn | busy
 }
 
-// FriendCard is one friend row.
-type FriendCard struct {
-	Key    string `json:"key"`   // stable key: KeyFP (account) or Code (legacy)
-	Name   string `json:"name"`  // display name
-	State  string `json:"state"` // connected | connecting | online | offline
-	Online bool   `json:"online"`
-}
-
 // RoomMember mirrors protocol.RoomMember for the UI.
 type RoomMember struct {
 	Username  string `json:"username"`
@@ -47,23 +39,28 @@ type GameInfo struct {
 
 // Settings is the settings section state.
 type Settings struct {
-	Name   string `json:"name"`
-	Server string `json:"server"`
+	Name      string `json:"name"`
+	Server    string `json:"server"`
+	UpdateURL string `json:"updateUrl"`
+}
+
+// UpdateInfo is the About-panel self-update state.
+type UpdateInfo struct {
+	Status  string `json:"status"`            // "" | checking | error:... | current | ready
+	Ready   bool   `json:"ready"`             // new version downloaded, pending install
+	Version string `json:"version"`           // version that is ready to install
+	Notes   string `json:"notes"`             // release notes from the manifest
 }
 
 // State is the full renderable state pushed to the frontend.
 type State struct {
-	Status     StatusInfo   `json:"status"`
-	Fullscreen bool         `json:"fullscreen"`
-	Version    string       `json:"version"`
-	Code       string       `json:"code"`
-	Account    string       `json:"account"`
-	LoggedIn   bool         `json:"loggedIn"`
-	AddHint    string       `json:"addHint"`
-	Settings   Settings     `json:"settings"`
-	Friends    []FriendCard `json:"friends"`
-	Room       RoomInfo     `json:"room"`
-	Game       GameInfo     `json:"game"`
+	Status     StatusInfo `json:"status"`
+	Fullscreen bool       `json:"fullscreen"`
+	Version    string     `json:"version"`
+	Settings   Settings   `json:"settings"`
+	Room       RoomInfo   `json:"room"`
+	Game       GameInfo   `json:"game"`
+	Update     UpdateInfo `json:"update"`
 }
 
 // MarshalState encodes state to JSON.

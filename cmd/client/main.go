@@ -38,7 +38,6 @@ func run() error {
 		headless      = flag.Bool("headless", false, "run as a background agent without the interactive command loop")
 		debugPackets  = flag.Bool("debug-packets", false, "log every packet flowing between the virtual NIC and the tunnel")
 		keyfile       = flag.String("keyfile", agent.DefaultKeyfile(), "path to the X25519 identity key (created on first run)")
-		friendsFile   = flag.String("friends", "", "path to the friends allowlist (base64 fingerprints, one per line; # comments)")
 	)
 	flag.Parse()
 	if *name == "" {
@@ -56,7 +55,6 @@ func run() error {
 		LanEmu:        *lanEmu,
 		DebugPackets:  *debugPackets,
 		Keyfile:       *keyfile,
-		FriendsFile:   *friendsFile,
 		Info:          func(f string, a ...any) { fmt.Printf(f+"\n", a...) },
 		Logf:          log.Printf,
 	})
@@ -137,8 +135,8 @@ func printStatus(st agent.Status, snaps []p2p.Snapshot) {
 		fmt.Println("status          : not registered yet")
 		return
 	}
-	fmt.Printf("status          : id=%s vip=%s pub=%s nat=%s friends=%d\n",
-		st.ID, st.VirtualIP, st.Public, st.NAT, st.FriendCt)
+	fmt.Printf("status          : id=%s vip=%s pub=%s nat=%s\n",
+		st.ID, st.VirtualIP, st.Public, st.NAT)
 	if len(snaps) == 0 {
 		fmt.Println("  (no connections yet)")
 	}

@@ -19,14 +19,9 @@ import (
 func startTestServer(t *testing.T) string {
 	t.Helper()
 	reg := server.NewRegistry()
-	acct, err := server.NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
-	if err != nil {
-		t.Fatalf("account store: %v", err)
-	}
-	reg.SetFriendCheck(acct.IsFriend)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		server.HandleWS(reg, acct, "", w, r)
+		server.HandleWS(reg, "", w, r)
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -95,16 +90,13 @@ func buildStunBindingResponse(req []byte, src *net.UDPAddr) []byte {
 	return append(hdr, attr...)
 }
 
-// startTestAgent registers a brand-new account and runs the agent until
+// startTestAgent runs an anonymous agent (name + auto-created identity) until
 // registration completes.
 func startTestAgent(t *testing.T, wsURL, stunAddr, user string) *Agent {
 	t.Helper()
 	opts := Options{
 		Name:          user,
 		Server:        wsURL,
-		Account:       user,
-		Password:      "testpass",
-		Create:        true,
 		UseVnic:       false,
 		LanEmu:        false,
 		StunPrimary:   stunAddr,
@@ -121,8 +113,7 @@ func startTestAgent(t *testing.T, wsURL, stunAddr, user string) *Agent {
 	go a.Run(ctx)
 	t.Cleanup(func() { cancel(); a.Close() })
 	waitFor(t, 10*time.Second, func() bool {
-		st := a.Status()
-		return st.Registered && st.Account == user
+		return a.Status().Registered
 	}, user+" registration")
 	return a
 }
@@ -158,10 +149,10 @@ func hasPeer(list []protocol.Peer, name string) bool {
 	return false
 }
 
-// TestRoomIntegration verifies the M7b one-click-join promise end to end: two
-// account agents connect to a real server, the host creates a room, the guest
+// TestRoomIntegration verifies the one-click-join promise end to end: two
+// anonymous agents connect to a real server, the host creates a room, the guest
 // joins by code, and they instantly become mutually visible and whitelisted
-// for P2P even though they are not friends.
+// for P2P — the room code is the sole gate.
 func TestRoomIntegration(t *testing.T) {
 	wsURL := startTestServer(t)
 	stunAddr := startTestStun(t)

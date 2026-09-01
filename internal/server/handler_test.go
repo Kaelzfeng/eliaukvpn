@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,22 +12,18 @@ import (
 	"eliaukvpn/internal/protocol"
 )
 
-// These tests drive the real WebSocket handler end to end: account creation,
-// friend visibility, presence, room membership, and the connect_request gate.
+// These tests drive the real WebSocket handler end to end: anonymous
+// registration, room membership as the sole visibility gate, and the
+// connect_request gate.
 
-func newTestServer(t *testing.T) (*httptest.Server, *Registry, *AccountStore) {
+func newTestServer(t *testing.T) (*httptest.Server, *Registry) {
 	t.Helper()
 	reg := NewRegistry()
-	acct, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg.SetFriendCheck(acct.IsFriend)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		HandleWS(reg, acct, "127.0.0.1:1", w, r)
+		HandleWS(reg, "127.0.0.1:1", w, r)
 	}))
 	t.Cleanup(srv.Close)
-	return srv, reg, acct
+	return srv, reg
 }
 
 func dialWS(t *testing.T, srv *httptest.Server) *websocket.Conn {
@@ -63,8 +58,8 @@ func readEnv(t *testing.T, conn *websocket.Conn) protocol.Envelope {
 }
 
 // readEnvUntil reads messages until one of the wanted type arrives, skipping
-// peers_list/presence broadcasts that arrive as a side effect of other clients
-// registering or reporting endpoints.
+// peers_list broadcasts that arrive as a side effect of other clients
+// registering or joining rooms.
 func readEnvUntil(t *testing.T, conn *websocket.Conn, want string) protocol.Envelope {
 	t.Helper()
 	for {
@@ -72,19 +67,17 @@ func readEnvUntil(t *testing.T, conn *websocket.Conn, want string) protocol.Enve
 		if env.Type == want {
 			return env
 		}
-		if env.Type != protocol.TypePeersList && env.Type != protocol.TypePresence {
+		if env.Type != protocol.TypePeersList {
 			t.Fatalf("got %q while waiting for %q", env.Type, want)
 		}
 	}
 }
 
-// regAccount registers (creating the account when create=true) and returns the
+// regClient registers an anonymous client (name + fingerprint) and returns the
 // registered payload.
-func regAccount(t *testing.T, conn *websocket.Conn, name, pw, fp string, create bool) protocol.Registered {
+func regClient(t *testing.T, conn *websocket.Conn, name, fp string) protocol.Registered {
 	t.Helper()
-	sendWS(t, conn, protocol.TypeRegister, protocol.RegisterRequest{
-		Name: name, Account: name, Password: pw, PublicKey: fp, Create: create,
-	})
+	sendWS(t, conn, protocol.TypeRegister, protocol.RegisterRequest{Name: name, PublicKey: fp})
 	env := readEnv(t, conn)
 	if env.Type != protocol.TypeRegistered {
 		t.Fatalf("register %s: got %q", name, env.Type)
@@ -96,96 +89,50 @@ func regAccount(t *testing.T, conn *websocket.Conn, name, pw, fp string, create 
 	return reg
 }
 
-func TestAccountRegisterAndLegacy(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+func TestAnonymousRegister(t *testing.T) {
+	srv, reg := newTestServer(t)
 	conn := dialWS(t, srv)
 
-	reg := regAccount(t, conn, "host", "pw", "fpHost", true)
-	if reg.Account != "host" || reg.KeyFP != "fpHost" || reg.Token == "" {
-		t.Fatalf("registered: %+v", reg)
+	regPayload := regClient(t, conn, "host", "fpHost")
+	if regPayload.ClientID == "" || regPayload.VirtualIP == "" {
+		t.Fatalf("registered: %+v", regPayload)
 	}
-	if len(reg.Friends) != 0 || reg.Room != "" {
-		t.Fatalf("fresh account should have no friends/room: %+v", reg)
+	if regPayload.Room != "" {
+		t.Fatalf("fresh client should not be in a room: %+v", regPayload)
+	}
+	if c, ok := reg.ClientByFP("fpHost"); !ok || c.Name != "host" {
+		t.Fatalf("ClientByFP: %+v (ok=%v)", c, ok)
 	}
 
-	// Wrong password must be rejected with an error.
+	// A register missing name or fingerprint must be rejected.
 	conn2 := dialWS(t, srv)
-	sendWS(t, conn2, protocol.TypeRegister, protocol.RegisterRequest{
-		Name: "host", Account: "host", Password: "bad", PublicKey: "fpX",
-	})
+	sendWS(t, conn2, protocol.TypeRegister, protocol.RegisterRequest{PublicKey: "fpX"})
 	if env := readEnv(t, conn2); env.Type != protocol.TypeError {
-		t.Fatalf("wrong password: got %q, want error", env.Type)
+		t.Fatalf("missing name: got %q, want error", env.Type)
 	}
-
-	// A cached token logs in without a password.
-	conn4 := dialWS(t, srv)
-	sendWS(t, conn4, protocol.TypeRegister, protocol.RegisterRequest{
-		Name: "host", Account: "host", Token: reg.Token, PublicKey: "fpHost",
-	})
-	if env := readEnv(t, conn4); env.Type != protocol.TypeRegistered {
-		t.Fatalf("token login: got %q", env.Type)
-	}
-
-	// Legacy anonymous clients still work.
 	conn3 := dialWS(t, srv)
-	sendWS(t, conn3, protocol.TypeRegister, protocol.RegisterRequest{Name: "anon"})
-	if env := readEnv(t, conn3); env.Type != protocol.TypeRegistered {
-		t.Fatalf("legacy register: got %q", env.Type)
+	sendWS(t, conn3, protocol.TypeRegister, protocol.RegisterRequest{Name: "noFP"})
+	if env := readEnv(t, conn3); env.Type != protocol.TypeError {
+		t.Fatalf("missing public key: got %q, want error", env.Type)
 	}
 }
 
-func TestFriendVisibilityPresence(t *testing.T) {
-	srv, reg, _ := newTestServer(t)
+func TestConnectGateOutsideRoom(t *testing.T) {
+	srv, reg := newTestServer(t)
 	host := dialWS(t, srv)
-	join := dialWS(t, srv)
 	eve := dialWS(t, srv)
 
-	regAccount(t, host, "host", "pw", "fpHost", true)
-	regAccount(t, join, "join", "pw", "fpJoin", true)
-	regAccount(t, eve, "eve", "pw", "fpEve", true)
+	regClient(t, host, "host", "fpHost")
+	regClient(t, eve, "eve", "fpEve")
 
-	// Before being friends, host must not see join/eve in peers_list.
+	// Outside a room, host must not see eve (room membership is the only gate).
 	sendWS(t, host, protocol.TypeListPeers, struct{}{})
 	var list protocol.PeersList
 	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypePeersList).Data, &list)
 	if len(list.Peers) != 0 {
-		t.Fatalf("strangers visible before friendship: %+v", list.Peers)
+		t.Fatalf("strangers visible outside a room: %+v", list.Peers)
 	}
 
-	// host adds join.
-	sendWS(t, host, protocol.TypeFriendAdd, protocol.FriendAdd{Username: "join"})
-
-	var ok protocol.FriendAddOk
-	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypeFriendAddOk).Data, &ok)
-	if ok.Friend.Username != "join" || !ok.Friend.Online || ok.Friend.KeyFP != "fpJoin" {
-		t.Fatalf("friend_add_ok: %+v", ok.Friend)
-	}
-	var fl protocol.FriendList
-	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypeFriendList).Data, &fl)
-	if len(fl.Friends) != 1 || fl.Friends[0].Username != "join" || !fl.Friends[0].Online {
-		t.Fatalf("friend_list: %+v", fl.Friends)
-	}
-	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypePeersList).Data, &list)
-	if len(list.Peers) != 1 || list.Peers[0].Name != "join" {
-		t.Fatalf("visible peers after add: %+v", list.Peers)
-	}
-
-	// join gets a friend_list with host (symmetric add).
-	var jfl protocol.FriendList
-	_ = json.Unmarshal(readEnvUntil(t, join, protocol.TypeFriendList).Data, &jfl)
-	if len(jfl.Friends) != 1 || jfl.Friends[0].Username != "host" {
-		t.Fatalf("join friend_list: %+v", jfl.Friends)
-	}
-
-	// join disconnects -> host gets presence {join, offline}.
-	join.Close()
-	var pres protocol.Presence
-	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypePresence).Data, &pres)
-	if pres.Username != "join" || pres.Online {
-		t.Fatalf("presence: %+v", pres)
-	}
-
-	// eve is not a friend: host cannot connect to her (visibility gate).
 	sendWS(t, host, protocol.TypeReportEndpoint, protocol.ReportEndpoint{
 		PublicIP: "1.2.3.4", PublicPort: 1000, NATType: "cone",
 		Candidates: []protocol.Candidate{{IP: "1.2.3.4", Port: 1000, Type: "public"}},
@@ -194,24 +141,32 @@ func TestFriendVisibilityPresence(t *testing.T) {
 		PublicIP: "5.6.7.8", PublicPort: 2000, NATType: "cone",
 		Candidates: []protocol.Candidate{{IP: "5.6.7.8", Port: 2000, Type: "public"}},
 	})
-	eveClient, _ := reg.ClientByAccount("eve")
+	eveClient, _ := reg.ClientByFP("fpEve")
 	sendWS(t, host, protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: eveClient.ID})
 	var errMsg protocol.Error
 	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypeError).Data, &errMsg)
 	if errMsg.Message == "" {
-		t.Fatal("expected an error for connecting to a non-friend")
+		t.Fatal("expected an error for connecting to a stranger outside a room")
 	}
 }
 
 func TestRoomLifecycle(t *testing.T) {
-	srv, reg, _ := newTestServer(t)
+	srv, reg := newTestServer(t)
 	host := dialWS(t, srv)
 	join := dialWS(t, srv)
 	eve := dialWS(t, srv)
 
-	regAccount(t, host, "host", "pw", "fpHost", true)
-	regAccount(t, join, "join", "pw", "fpJoin", true)
-	regAccount(t, eve, "eve", "pw", "fpEve", true)
+	regClient(t, host, "host", "fpHost")
+	regClient(t, join, "join", "fpJoin")
+	regClient(t, eve, "eve", "fpEve")
+
+	// Before any room, host sees no peers.
+	sendWS(t, host, protocol.TypeListPeers, struct{}{})
+	var list protocol.PeersList
+	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypePeersList).Data, &list)
+	if len(list.Peers) != 0 {
+		t.Fatalf("strangers visible before a room: %+v", list.Peers)
+	}
 
 	// host creates a room.
 	sendWS(t, host, protocol.TypeRoomCreate, struct{}{})
@@ -243,9 +198,8 @@ func TestRoomLifecycle(t *testing.T) {
 		t.Fatalf("join room_update: %+v", joined.Members)
 	}
 
-	// Now host and join see each other even though they are not friends.
+	// Now host and join see each other (same room).
 	sendWS(t, host, protocol.TypeListPeers, struct{}{})
-	var list protocol.PeersList
 	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypePeersList).Data, &list)
 	if len(list.Peers) != 1 || list.Peers[0].Name != "join" {
 		t.Fatalf("room members not visible: %+v", list.Peers)
@@ -266,7 +220,7 @@ func TestRoomLifecycle(t *testing.T) {
 		t.Fatalf("join room_update: %d members, want 3", len(joined.Members))
 	}
 
-	// Same-room members can be wired even though they are not friends.
+	// Same-room members can be wired.
 	sendWS(t, host, protocol.TypeReportEndpoint, protocol.ReportEndpoint{
 		PublicIP: "1.2.3.4", PublicPort: 1000, NATType: "cone",
 		Candidates: []protocol.Candidate{{IP: "1.2.3.4", Port: 1000, Type: "public"}},
@@ -275,7 +229,7 @@ func TestRoomLifecycle(t *testing.T) {
 		PublicIP: "5.6.7.8", PublicPort: 2000, NATType: "cone",
 		Candidates: []protocol.Candidate{{IP: "5.6.7.8", Port: 2000, Type: "public"}},
 	})
-	eveClient, _ := reg.ClientByAccount("eve")
+	eveClient, _ := reg.ClientByFP("fpEve")
 	sendWS(t, host, protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: eveClient.ID})
 	var cc protocol.ConnectCandidates
 	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypeConnectCandidates).Data, &cc)
@@ -291,10 +245,64 @@ func TestRoomLifecycle(t *testing.T) {
 	}
 
 	// eve disconnects -> room_update now lists only online members (host; eve is
-	// gone, join left). host and eve are not friends so no presence is sent.
+	// gone, join left).
 	eve.Close()
 	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypeRoomUpdate).Data, &joined)
 	if len(joined.Members) != 1 || joined.Members[0].Username != "host" {
 		t.Fatalf("after eve disconnect: %d members, want 1", len(joined.Members))
 	}
+}
+
+// TestHostMigration verifies that when the room host leaves while members
+// remain, the longest-registered remaining member is promoted to host — so the
+// game panel's "房主地址" keeps resolving to a live member.
+func TestHostMigration(t *testing.T) {
+	srv, _ := newTestServer(t)
+	host := dialWS(t, srv)
+	join := dialWS(t, srv)
+	eve := dialWS(t, srv)
+
+	regClient(t, host, "host", "fpHost")
+	regClient(t, join, "join", "fpJoin")
+	regClient(t, eve, "eve", "fpEve")
+
+	// host creates a room; join and eve join it.
+	sendWS(t, host, protocol.TypeRoomCreate, struct{}{})
+	var created protocol.RoomCreated
+	_ = json.Unmarshal(readEnvUntil(t, host, protocol.TypeRoomCreated).Data, &created)
+	readEnvUntil(t, host, protocol.TypeRoomJoined)
+	sendWS(t, join, protocol.TypeRoomJoin, protocol.RoomJoin{Code: created.Code})
+	readEnvUntil(t, join, protocol.TypeRoomJoined)
+	readEnvUntil(t, host, protocol.TypeRoomUpdate)
+	readEnvUntil(t, join, protocol.TypeRoomUpdate)
+	sendWS(t, eve, protocol.TypeRoomJoin, protocol.RoomJoin{Code: created.Code})
+	readEnvUntil(t, eve, protocol.TypeRoomJoined)
+	readEnvUntil(t, host, protocol.TypeRoomUpdate)
+	readEnvUntil(t, join, protocol.TypeRoomUpdate)
+	readEnvUntil(t, eve, protocol.TypeRoomUpdate)
+
+	// host disconnects -> join (the oldest remaining member) becomes host.
+	host.Close()
+	var joined protocol.RoomJoined
+	_ = json.Unmarshal(readEnvUntil(t, join, protocol.TypeRoomUpdate).Data, &joined)
+	if len(joined.Members) != 2 {
+		t.Fatalf("after host disconnect: %d members, want 2", len(joined.Members))
+	}
+	var joinIsHost, eveIsHost bool
+	for _, m := range joined.Members {
+		switch m.Username {
+		case "join":
+			joinIsHost = m.Host
+		case "eve":
+			eveIsHost = m.Host
+		}
+	}
+	if !joinIsHost {
+		t.Fatal("join should have been promoted to host after host disconnect")
+	}
+	if eveIsHost {
+		t.Fatal("eve must not become host; join registered first")
+	}
+	// eve receives the same update.
+	_ = json.Unmarshal(readEnvUntil(t, eve, protocol.TypeRoomUpdate).Data, &joined)
 }

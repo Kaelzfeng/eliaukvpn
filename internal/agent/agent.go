@@ -1,13 +1,11 @@
-// Package agent runs the Eliauk VPN client core: identity/friends loading,
-// P2P socket + STUN probe, coordination-server registration, tunnel/virtual
-// NIC/LAN-discovery setup, and automatic peer connection. It is shared by the
+// Package agent runs the Eliauk VPN client core: identity loading, P2P socket +
+// STUN probe, coordination-server registration, tunnel/virtual NIC/LAN-discovery
+// setup, room membership, and automatic peer connection. It is shared by the
 // interactive CLI (cmd/client) and the Windows tray GUI (cmd/gui), so both
 // present the same agent underneath.
 package agent
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -17,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -55,22 +52,6 @@ type Options struct {
 	LanEmu        bool
 	DebugPackets  bool
 	Keyfile       string
-	FriendsFile   string
-	// Friends is the allowlist as raw 32-byte X25519 public keys, used by the
-	// GUI (which manages friends in its config) instead of a friends file.
-	// If FriendsFile is set it takes precedence.
-	Friends [][]byte
-	// M7 account login. When Account is set the agent registers an account
-	// client: it sends the username plus either a password (first login or
-	// account creation) or a cached session token (Password empty), and binds
-	// its X25519 fingerprint to the account. Create=true registers a brand-new
-	// account. An empty Account keeps the legacy anonymous mode. The fresh
-	// session token comes back in Registered.Token and should be cached so the
-	// next start needs no password.
-	Account  string
-	Password string
-	Token    string
-	Create   bool
 	// Info prints user-facing progress lines (identity, registration,
 	// endpoints). Logf prints warnings and diagnostics.
 	Info func(format string, args ...any)
@@ -85,15 +66,12 @@ type Status struct {
 	Public     string
 	NAT        string
 	Identity   string
-	FriendCt   int
 	Registered bool
 	// VnicMsg is non-empty when the virtual NIC could not be created (the
 	// process was not elevated, the Wintun driver is missing, etc.). The GUI
 	// shows it prominently instead of silently continuing without a NIC.
 	VnicMsg string
-	// M7: the logged-in account username ("" for legacy anonymous clients),
-	// the last server error (auth failures, etc.) and the room code if in one.
-	Account string
+	// LastErr is the last server error, and Room the room code if in one.
 	LastErr string
 	Room    string
 }
@@ -114,22 +92,15 @@ type Agent struct {
 	byName    map[string]protocol.Peer
 
 	identity *crypto.Identity
-	// friends is the *effective* tunnel whitelist, recomputed as the union of
-	// baseFP (legacy config friends), the M7 account friend directory (byUser)
-	// and the current room members (roomFP).
-	friends  [][]byte
-	baseFP   [][]byte // legacy config friends (from Options / friends file)
-	roomFP   [][]byte // fingerprints of the room members (M7b)
-	probe    *stun.Result
-	p2pConn  *net.UDPConn
+	// friends is the *effective* tunnel whitelist: the current room members'
+	// fingerprints (roomFP). Empty when not in a room.
+	friends [][]byte
+	roomFP  [][]byte // fingerprints of the room members (excluding self)
+	probe   *stun.Result
+	p2pConn *net.UDPConn
 
-	// M7 account state.
-	myAccount string                     // my username ("" = legacy)
-	myToken   string                     // fresh session token from the server
-	myKeyFP   string                     // fingerprint the server bound to my account
-	byUser    map[string]protocol.Friend // account friend directory (username -> friend)
-	room      *RoomState                 // current room, nil when not in one
-	errNote   string                     // last server error, cleared on registration
+	room    *RoomState // current room, nil when not in one
+	errNote string     // last server error, cleared on registration
 
 	vnicErr string
 
@@ -164,47 +135,13 @@ func New(opts Options) (*Agent, error) {
 	}
 
 	// 0. Load (or create) the long-term X25519 identity. This authenticates
-	//    the handshake to friends and encrypts all tunnel data (M6). Share the
-	//    fingerprint below so friends can whitelist us.
+	//    the handshake to room members and encrypts all tunnel data (M6). Share
+	//    the fingerprint below so the server can place us in a room.
 	identity, err := crypto.LoadOrCreate(opts.Keyfile)
 	if err != nil {
 		return nil, fmt.Errorf("load identity %q: %w", opts.Keyfile, err)
 	}
 	opts.Info("identity        : %s", identity.Fingerprint())
-
-	// 0b. Load the friends allowlist (M6b): only peers whose static keys are
-	//     listed here may establish a session. Each line is one base64
-	//     fingerprint copied from a friend's "identity:" line.
-	var friends [][]byte
-	if opts.FriendsFile != "" {
-		f, err := os.Open(opts.FriendsFile)
-		if err != nil {
-			return nil, fmt.Errorf("open friends list: %w", err)
-		}
-		sc := bufio.NewScanner(f)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			raw, err := crypto.ParseFingerprint(line)
-			if err != nil {
-				f.Close()
-				return nil, fmt.Errorf("friends list %q line %q: %w", opts.FriendsFile, line, err)
-			}
-			friends = append(friends, raw)
-		}
-		if err := sc.Err(); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("read friends list: %w", err)
-		}
-		f.Close()
-		opts.Info("friends         : %d allowed", len(friends))
-	} else if len(opts.Friends) > 0 {
-		// GUI mode: friends come from the config, already parsed.
-		friends = append(friends, opts.Friends...)
-		opts.Info("friends         : %d allowed", len(friends))
-	}
 
 	// 1. Open the P2P socket FIRST — hole punching must use the same socket
 	//    whose public mapping we advertise, so the STUN probe runs on it.
@@ -216,9 +153,9 @@ func New(opts Options) (*Agent, error) {
 	opts.Info("public endpoint : %s", probeString(probe))
 	opts.Info("NAT type        : %s", probe.NAT)
 
-	// 2. Register with the coordination server. M7 account clients authenticate
-	//    with a username plus a password (first login / creation) or a cached
-	//    session token, and bind their identity fingerprint to the account.
+	// 2. Register with the coordination server. The client identifies itself by
+	//    its X25519 fingerprint (the stable identity rooms key on) and a display
+	//    name.
 	conn, _, err := websocket.DefaultDialer.Dial(opts.Server, nil)
 	if err != nil {
 		p2pConn.Close()
@@ -227,13 +164,6 @@ func New(opts Options) (*Agent, error) {
 	regReq := protocol.RegisterRequest{
 		Name:      opts.Name,
 		PublicKey: identity.Fingerprint(),
-		Account:   opts.Account,
-		Password:  opts.Password,
-		Token:     opts.Token,
-		Create:    opts.Create,
-	}
-	if regReq.Name == "" {
-		regReq.Name = regReq.Account
 	}
 	if err := send(conn, protocol.TypeRegister, regReq); err != nil {
 		p2pConn.Close()
@@ -245,13 +175,8 @@ func New(opts Options) (*Agent, error) {
 		opts:      opts,
 		conn:      conn,
 		p2pConn:   p2pConn,
-		identity:   identity,
-		friends:    friends,
-		baseFP:     friends,
-		myAccount:  opts.Account,
-		myToken:    opts.Token,
-		byUser:     make(map[string]protocol.Friend),
-		probe:      probe,
+		identity:  identity,
+		probe:     probe,
 		routes:    make(map[string]string),
 		attempted: make(map[string]bool),
 		byID:      make(map[string]protocol.Peer),
@@ -292,9 +217,7 @@ func (a *Agent) Status() Status {
 		ID:         a.myID,
 		VirtualIP:  a.myVIP,
 		Identity:   a.identity.Fingerprint(),
-		FriendCt:   len(a.friends),
 		Registered: a.myID != "",
-		Account:    a.myAccount,
 		LastErr:    a.errNote,
 	}
 	if a.probe != nil {
@@ -358,79 +281,18 @@ func (a *Agent) Friends() []string {
 	return out
 }
 
-// AddFriend validates and appends a fingerprint to the legacy config allowlist
-// (baseFP), then re-syncs the tunnel's whitelist immediately (M6b). It is
-// idempotent: adding an existing friend is a no-op. Safe to call before
-// registration — the tunnel picks the updated list up when it is created.
-func (a *Agent) AddFriend(fp string) error {
-	raw, err := crypto.ParseFingerprint(fp)
-	if err != nil {
-		return fmt.Errorf("invalid friend code: %w", err)
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for _, k := range a.baseFP {
-		if bytes.Equal(k, raw) {
-			return nil // already a friend
-		}
-	}
-	a.baseFP = append(a.baseFP, raw)
-	a.syncWhitelistLocked()
-	if a.opts.Info != nil {
-		a.opts.Info("friends         : %d allowed", len(a.friends))
-	}
-	return nil
-}
-
-// RemoveFriend deletes a fingerprint from the legacy config allowlist and
-// re-syncs the tunnel. An already-established session is not torn down (the
-// whitelist is enforced at handshake time); future connections are refused.
-func (a *Agent) RemoveFriend(fp string) error {
-	raw, err := crypto.ParseFingerprint(fp)
-	if err != nil {
-		return fmt.Errorf("invalid friend code: %w", err)
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for i, k := range a.baseFP {
-		if bytes.Equal(k, raw) {
-			a.baseFP = append(a.baseFP[:i], a.baseFP[i+1:]...)
-			a.syncWhitelistLocked()
-			if a.opts.Info != nil {
-				a.opts.Info("friends         : %d allowed", len(a.friends))
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("friend not in list")
-}
-
-// syncWhitelistLocked rebuilds the effective tunnel whitelist as the union of
-// the legacy config friends (baseFP), the M7 account friend directory (byUser)
-// and the current room members (roomFP), then pushes it to the tunnel. Callers
-// hold a.mu; the tunnel only exists after registration.
+// syncWhitelistLocked rebuilds the effective tunnel whitelist from the current
+// room members (roomFP), then pushes it to the tunnel. Callers hold a.mu; the
+// tunnel only exists after registration. With no room, the whitelist is empty.
 func (a *Agent) syncWhitelistLocked() {
-	a.friends = dedupFP(append(append(append([][]byte(nil), a.baseFP...), a.directoryFPsLocked()...), a.roomFP...))
+	a.friends = dedupFP(a.roomFP)
 	if a.tunnel != nil {
 		a.tunnel.SetFriends(a.friends)
 	}
 }
 
-// directoryFPsLocked returns the fingerprints of every friend in the M7
-// account directory (empty KeyFP entries — friends who never logged in with an
-// identity — are skipped). Callers hold a.mu.
-func (a *Agent) directoryFPsLocked() [][]byte {
-	var out [][]byte
-	for _, f := range a.byUser {
-		if raw, err := crypto.ParseFingerprint(f.KeyFP); err == nil {
-			out = append(out, raw)
-		}
-	}
-	return out
-}
-
 // dedupFP concatenates fingerprint byte-slices, deduplicating by base64 so a
-// fingerprint that is both a friend and a room member appears once.
+// fingerprint appears once.
 func dedupFP(lists ...[][]byte) [][]byte {
 	var out [][]byte
 	seen := make(map[string]bool)
@@ -447,64 +309,7 @@ func dedupFP(lists ...[][]byte) [][]byte {
 	return out
 }
 
-// ---- M7 account directory & rooms ----
-
-// Account returns the logged-in username ("" for legacy anonymous clients).
-func (a *Agent) Account() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.myAccount
-}
-
-// Token returns the session token from the last successful registration. Cache
-// it so the next start can log in without a password.
-func (a *Agent) Token() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.myToken
-}
-
-// FriendDirectory returns the account friend directory with presence, sorted
-// by username. Empty for legacy anonymous clients.
-func (a *Agent) FriendDirectory() []protocol.Friend {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	out := make([]protocol.Friend, 0, len(a.byUser))
-	for _, f := range a.byUser {
-		out = append(out, f)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
-	return out
-}
-
-// AddFriendByName asks the server to add a friend by username (symmetric on
-// the server). The friend directory refresh arrives asynchronously.
-func (a *Agent) AddFriendByName(username string) error {
-	username = strings.TrimSpace(username)
-	if username == "" {
-		return fmt.Errorf("用户名不能为空")
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.myAccount == "" {
-		return fmt.Errorf("请先登录账号")
-	}
-	return a.writeJSON(protocol.TypeFriendAdd, protocol.FriendAdd{Username: username})
-}
-
-// RemoveFriendByName asks the server to drop a friend by username (symmetric).
-func (a *Agent) RemoveFriendByName(username string) error {
-	username = strings.TrimSpace(username)
-	if username == "" {
-		return fmt.Errorf("用户名不能为空")
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.myAccount == "" {
-		return fmt.Errorf("请先登录账号")
-	}
-	return a.writeJSON(protocol.TypeFriendRemove, protocol.FriendRemove{Username: username})
-}
+// ---- rooms ----
 
 // RoomState returns the current room (nil when not in one). A copy is returned
 // so callers can hold it without the agent lock.
@@ -524,9 +329,6 @@ func (a *Agent) RoomState() *RoomState {
 func (a *Agent) CreateRoom() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.myAccount == "" {
-		return fmt.Errorf("请先登录账号")
-	}
 	return a.writeJSON(protocol.TypeRoomCreate, struct{}{})
 }
 
@@ -538,9 +340,6 @@ func (a *Agent) JoinRoom(code string) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.myAccount == "" {
-		return fmt.Errorf("请先登录账号")
-	}
 	return a.writeJSON(protocol.TypeRoomJoin, protocol.RoomJoin{Code: code})
 }
 
@@ -548,45 +347,7 @@ func (a *Agent) JoinRoom(code string) error {
 func (a *Agent) LeaveRoom() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.myAccount == "" {
-		return fmt.Errorf("请先登录账号")
-	}
 	return a.writeJSON(protocol.TypeRoomLeave, struct{}{})
-}
-
-// setFriendDirectory replaces the whole account friend directory (full refresh
-// after registration, a friend add/remove) and re-syncs the whitelist.
-func (a *Agent) setFriendDirectory(friends []protocol.Friend) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.byUser = make(map[string]protocol.Friend, len(friends))
-	for _, f := range friends {
-		a.byUser[f.Username] = f
-	}
-	a.syncWhitelistLocked()
-}
-
-// upsertFriend merges one resolved friend into the directory (the server sends
-// friend_add_ok right before a full friend_list refresh, so the UI updates
-// immediately).
-func (a *Agent) upsertFriend(f protocol.Friend) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if f.Username == "" {
-		return
-	}
-	a.byUser[f.Username] = f
-	a.syncWhitelistLocked()
-}
-
-// setFriendPresence updates one friend's online flag.
-func (a *Agent) setFriendPresence(user string, online bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if f, ok := a.byUser[user]; ok {
-		f.Online = online
-		a.byUser[user] = f
-	}
 }
 
 // setRoom installs the current room and whitelists its members (excluding us).
@@ -594,7 +355,7 @@ func (a *Agent) setRoom(rj *protocol.RoomJoined) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.room = &RoomState{Code: rj.Code, Members: rj.Members}
-	a.roomFP = memberFPs(a.myAccount, rj.Members)
+	a.roomFP = memberFPs(a.identity.Fingerprint(), rj.Members)
 	a.syncWhitelistLocked()
 }
 
@@ -606,25 +367,36 @@ func (a *Agent) updateRoomMembers(members []protocol.RoomMember) {
 		return
 	}
 	a.room.Members = members
-	a.roomFP = memberFPs(a.myAccount, members)
+	a.roomFP = memberFPs(a.identity.Fingerprint(), members)
 	a.syncWhitelistLocked()
 }
 
-// clearRoom leaves the current room: drop the room state and the room-sourced
-// whitelist entries (the server has already removed us from the room).
+// clearRoom leaves the current room: drop the room state, the room-sourced
+// whitelist entries, and the peers' /32 routes (the server has already removed
+// us from the room, so every room peer's route is now stale).
 func (a *Agent) clearRoom() {
+	var del []string
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.room = nil
 	a.roomFP = nil
+	del = make([]string, 0, len(a.routes))
+	for vip := range a.routes {
+		del = append(del, vip)
+	}
+	a.routes = make(map[string]string)
 	a.syncWhitelistLocked()
+	a.mu.Unlock()
+	for _, vip := range del {
+		a.removePeerRoute(vip)
+	}
 }
 
-// memberFPs extracts the fingerprints of every member except self.
+// memberFPs extracts the fingerprints of every member except self (matched by
+// fingerprint, not display name).
 func memberFPs(self string, members []protocol.RoomMember) [][]byte {
 	var out [][]byte
 	for _, m := range members {
-		if m.Username == self {
+		if m.KeyFP == self {
 			continue
 		}
 		if raw, err := crypto.ParseFingerprint(m.KeyFP); err == nil {
@@ -669,18 +441,6 @@ func (a *Agent) messageLoop() {
 			if t != nil {
 				t.BeginConnect(cc.PeerID, cc.PeerName, toUDPAddrs(cc.Candidates))
 			}
-		case protocol.TypeFriendList:
-			var fl protocol.FriendList
-			_ = json.Unmarshal(env.Data, &fl)
-			a.setFriendDirectory(fl.Friends)
-		case protocol.TypeFriendAddOk:
-			var ok protocol.FriendAddOk
-			_ = json.Unmarshal(env.Data, &ok)
-			a.upsertFriend(ok.Friend)
-		case protocol.TypePresence:
-			var p protocol.Presence
-			_ = json.Unmarshal(env.Data, &p)
-			a.setFriendPresence(p.Username, p.Online)
 		case protocol.TypeRoomCreated:
 			// The server follows room_created with a room_joined for the creator.
 		case protocol.TypeRoomJoined:
@@ -717,23 +477,6 @@ func (a *Agent) onRegistered(env protocol.Envelope) {
 	a.myID = reg.ClientID
 	a.myVIP = reg.VirtualIP
 	a.errNote = ""
-	if reg.Account != "" {
-		// M7: bind the account, cache the fresh session token (so the next
-		// start needs no password) and load the friend directory with presence.
-		a.myAccount = reg.Account
-		a.myToken = reg.Token
-		a.myKeyFP = reg.KeyFP
-		a.byUser = make(map[string]protocol.Friend, len(reg.Friends))
-		for _, f := range reg.Friends {
-			a.byUser[f.Username] = f
-		}
-		if reg.Room != "" {
-			a.room = &RoomState{Code: reg.Room}
-		}
-		// Recompute the whitelist so the directory and any room members are
-		// present before the tunnel is created below.
-		a.syncWhitelistLocked()
-	}
 	a.opts.Info("registered      : id=%s virtual_ip=%s", reg.ClientID, reg.VirtualIP)
 
 	tunnel := p2p.New(a.p2pConn, a.myID, a.opts.Logf)
@@ -919,18 +662,58 @@ func (a *Agent) ensurePeerRoute(peerVIP string) {
 	}
 }
 
+// removePeerRoute deletes the /32 host route for a peer's virtual IP, undoing
+// ensurePeerRoute when the peer leaves the room or the network. The add and
+// delete agree on the interface index, which the Wintun adapter keeps stable
+// for the lifetime of the process.
+func (a *Agent) removePeerRoute(peerVIP string) {
+	a.mu.Lock()
+	adVnic := a.adVnic
+	a.mu.Unlock()
+	if adVnic == nil || peerVIP == "" {
+		return
+	}
+	idx := adVnic.IfIndex()
+	if idx == 0 {
+		return
+	}
+	out, err := exec.Command("route", "delete", peerVIP, "mask", "255.255.255.255",
+		"0.0.0.0", "IF", fmt.Sprint(idx)).CombinedOutput()
+	if err != nil {
+		a.opts.Logf("route delete %s via if%d: %v %s", peerVIP, idx, err, strings.TrimSpace(string(out)))
+	}
+}
+
 // autoConnect updates the virtual-IP route table and sends a connect_request
 // for every online peer we haven't already tried, so the virtual LAN is fully
 // connected without manual `connect` commands.
 func (a *Agent) autoConnect(peers []protocol.Peer) {
 	var fresh []protocol.Peer
-	var routeVIPs []string
+	var addRoute, delRoute []string
 	a.mu.Lock()
+	// Reconcile the route table against the current peer list: a peer that left
+	// the room (or the network) drops out of the visible list, so its /32 route
+	// has to go too — otherwise packets to its stale virtual IP are silently
+	// dropped into the tunnel (M5 route-cleanup).
+	want := make(map[string]string, len(peers))
 	for _, p := range peers {
 		if p.VirtualIP != "" {
-			a.routes[p.VirtualIP] = p.ID
-			routeVIPs = append(routeVIPs, p.VirtualIP)
+			want[p.VirtualIP] = p.ID
 		}
+	}
+	for vip, id := range want {
+		if a.routes[vip] != id {
+			a.routes[vip] = id
+			addRoute = append(addRoute, vip)
+		}
+	}
+	for vip, id := range a.routes {
+		if want[vip] != id {
+			delete(a.routes, vip)
+			delRoute = append(delRoute, vip)
+		}
+	}
+	for _, p := range peers {
 		// Only auto-connect to peers that have reported a punchable endpoint —
 		// otherwise the server rejects the connect_request and marking the peer
 		// attempted here would prevent a later retry.
@@ -940,8 +723,11 @@ func (a *Agent) autoConnect(peers []protocol.Peer) {
 		}
 	}
 	a.mu.Unlock()
-	for _, vip := range routeVIPs {
+	for _, vip := range addRoute {
 		a.ensurePeerRoute(vip)
+	}
+	for _, vip := range delRoute {
+		a.removePeerRoute(vip)
 	}
 	for _, p := range fresh {
 		if err := a.writeJSON(protocol.TypeConnectRequest, protocol.ConnectRequest{PeerID: p.ID}); err != nil {

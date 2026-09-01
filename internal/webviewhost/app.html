@@ -117,28 +117,6 @@
   button.danger:hover:not(:disabled) { background: #3A2222; }
   button.small { padding: 6px 10px; font-size: 12px; }
 
-  /* friend code */
-  .code {
-    font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; color: #EDEFF3;
-    background: #2B2D32; border: 1px solid #3A3B40; border-radius: 6px; padding: 9px 11px;
-    overflow-wrap: anywhere; margin-bottom: 10px;
-  }
-
-  /* friend list */
-  .friend {
-    display: flex; align-items: center; gap: 9px; padding: 9px 8px;
-    border-bottom: 1px solid #2C2D31; border-radius: 6px; transition: background .14s;
-  }
-  .friend:last-child { border-bottom: none; }
-  .friend:hover { background: #2A2B30; }
-  .friend .name { flex: 1; font-size: 13px; overflow-wrap: anywhere; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; flex: 0 0 auto; }
-  .badge.connected  { background: #17351F; color: #3DDC6F; }
-  .badge.connecting { background: #3A2E12; color: #F0A030; }
-  .badge.online     { background: #14273A; color: #58A6FF; }
-  .badge.offline    { background: #2B2D32; color: #8B8E95; }
-  .empty { color: #8B8E95; font-size: 12px; }
-
   /* room members */
   .member { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 13px; }
   .member .ip { color: #8B8E95; font-size: 12px; margin-left: auto; font-family: Consolas, monospace; }
@@ -176,10 +154,8 @@
     </div>
     <nav class="nav">
       <button class="nav-item active" data-sec="overview">概览</button>
-      <button class="nav-item" data-sec="friends">好友</button>
       <button class="nav-item" data-sec="room">房间</button>
       <button class="nav-item" data-sec="game">游戏</button>
-      <button class="nav-item" data-sec="account">账号</button>
       <button class="nav-item" data-sec="settings">设置</button>
       <button class="nav-item" data-sec="about">关于</button>
     </nav>
@@ -206,29 +182,12 @@
         </div>
       </div>
       <div class="stat-grid">
-        <div class="card stat"><div class="stat-label">好友</div><div class="stat-value" id="statFriends">0</div></div>
         <div class="card stat"><div class="stat-label">房间</div><div class="stat-value" id="statRoom">未加入</div></div>
         <div class="card stat"><div class="stat-label">游戏</div><div class="stat-value" id="statGame">未运行</div></div>
-        <div class="card stat"><div class="stat-label">账号</div><div class="stat-value" id="statAccount">未登录</div></div>
       </div>
       <div class="card">
         <h2>快速上手</h2>
-        <div class="hint" style="margin-top:0;" id="quickHint">先在「设置」里填昵称和服务器地址并保存连接，然后在「账号」注册登录，再把好友码发给朋友即可联机。</div>
-      </div>
-    </section>
-
-    <section class="section" id="sec-friends">
-      <h1 class="sec-title">好友</h1>
-      <div class="card">
-        <div class="label">我的好友码</div>
-        <div class="code" id="code">—</div>
-        <button id="copyBtn">复制好友码</button>
-      </div>
-      <div class="card">
-        <input type="text" id="addInput" placeholder="输入好友码或用户名">
-        <button id="addBtn">添加好友</button>
-        <div class="hint" id="addHint"></div>
-        <div id="friendList" style="margin-top:10px;"></div>
+        <div class="hint" style="margin-top:0;" id="quickHint">先在「设置」里填昵称和服务器地址并保存连接，然后在「房间」创建一个房间拿到房间码，把码发给朋友即可联机。</div>
       </div>
     </section>
 
@@ -245,6 +204,7 @@
         <div class="label" id="roomTitle"></div>
         <div id="memberList"></div>
         <div class="btn-bar" style="margin-top:10px;">
+          <button class="ghost" id="copyRoomCodeBtn">复制房间码</button>
           <button class="ghost" id="leaveRoomBtn">离开房间</button>
         </div>
       </div>
@@ -253,7 +213,7 @@
     <section class="section" id="sec-game">
       <h1 class="sec-title">游戏（Minecraft 服务器）</h1>
       <div class="card">
-        <div class="hint" style="margin-top:0;">联机方式「对局域网开放」：好友在单人世界点「对局域网开放」，你这边在「多人游戏」刷新即可看到并加入（双方互为好友且已连接，Eliauk 自动把局域网发现转发到异地）。离线联机还需在主机端用 mod（如 LanServerProperties）关闭正版验证。</div>
+        <div class="hint" style="margin-top:0;">联机方式「对局域网开放」：房主在单人世界点「对局域网开放」，你这边在「多人游戏」刷新即可看到并加入（双方在同一房间且已连接，Eliauk 自动把局域网发现转发到异地）。离线联机还需在主机端用 mod（如 LanServerProperties）关闭正版验证。</div>
         <div class="label">Java 路径</div>
         <input type="text" id="java" placeholder="javaw.exe 路径">
         <div class="label">服务器 jar 路径</div>
@@ -276,25 +236,6 @@
       </div>
     </section>
 
-    <section class="section" id="sec-account">
-      <h1 class="sec-title">账号</h1>
-      <div class="card">
-        <div id="loginForm">
-          <input type="text" id="user" placeholder="用户名 / 账号">
-          <input type="password" id="pass" placeholder="密码">
-          <div class="btn-bar">
-            <button id="loginBtn">登录</button>
-            <button class="ghost" id="registerBtn">注册新账号</button>
-          </div>
-        </div>
-        <div id="accountInfo" style="display:none;">
-          <div class="label">当前账号</div>
-          <div class="code" id="accountName" style="margin-bottom:10px;"></div>
-          <button class="ghost small" id="logoutBtn">退出登录</button>
-        </div>
-      </div>
-    </section>
-
     <section class="section" id="sec-settings">
       <h1 class="sec-title">设置</h1>
       <div class="card">
@@ -302,6 +243,8 @@
         <input type="text" id="name" placeholder="显示昵称">
         <div class="label">服务器地址</div>
         <input type="text" id="server" placeholder="ws://host:port/ws">
+        <div class="label">更新源地址</div>
+        <input type="text" id="updateUrl" placeholder="https://example.com/update.json（留空禁用检查更新）">
         <button id="saveBtn">保存并连接</button>
       </div>
     </section>
@@ -317,11 +260,19 @@
       </div>
       <div class="card">
         <h2>说明</h2>
-        <div class="hint" style="margin-top:0;">基于 Wintun 的 P2P 虚拟局域网：异地组网、好友直连、房间联机、Minecraft 服务器托管。</div>
+        <div class="hint" style="margin-top:0;">基于 Wintun 的 P2P 虚拟局域网：房间联机、Minecraft 服务器托管、异地组网。</div>
       </div>
       <div class="card">
         <h2>项目</h2>
         <div class="hint" style="margin-top:0;">github.com/Kaelzfeng/eliaukvpn</div>
+      </div>
+      <div class="card">
+        <h2>更新</h2>
+        <div class="btn-bar" style="margin-top:4px;">
+          <button id="updateBtn">检查更新</button>
+        </div>
+        <div class="hint" id="updateStatus" style="margin-top:8px;"></div>
+        <div class="hint" id="updateNotes" style="margin-top:4px; white-space:pre-wrap;"></div>
       </div>
     </section>
 
@@ -338,8 +289,6 @@ window.eliauk.action = function (o) { window.eliaukAction(JSON.stringify(o)); };
 var el = function (id) { return document.getElementById(id); };
 var active = function (id) { return document.activeElement === el(id); };
 var setVal = function (id, v) { if (!active(id)) el(id).value = v || ""; };
-
-var STATE_LABEL = { connected: "已连接", connecting: "连接中", online: "在线", offline: "离线" };
 
 // sidebar navigation
 var navs = document.querySelectorAll(".nav-item");
@@ -365,31 +314,21 @@ function render(s) {
   el("aboutVersion").textContent = "v" + (s.version || "1.0.0");
 
   // overview stats
-  el("statFriends").textContent = (s.friends || []).length;
   el("statRoom").textContent = (s.room && s.room.in) ? s.room.code : "未加入";
   el("statGame").textContent = (s.game && s.game.running) ? "运行中" : "未运行";
-  el("statAccount").textContent = s.loggedIn ? s.account : "未登录";
 
   // settings
   setVal("name", s.settings && s.settings.name);
   setVal("server", s.settings && s.settings.server);
-
-  // account
-  if (s.loggedIn) {
-    el("loginForm").style.display = "none";
-    el("accountInfo").style.display = "block";
-    el("accountName").textContent = s.account;
-  } else {
-    el("loginForm").style.display = "block";
-    el("accountInfo").style.display = "none";
-  }
-
-  // friends
-  el("code").textContent = s.code || "";
-  el("addHint").textContent = s.addHint || "";
-  renderFriends(s.friends || []);
+  setVal("updateUrl", s.settings && s.settings.updateUrl);
 
   renderRoom(s.room || {});
+
+  // about / update
+  var upd = s.update || {};
+  el("updateBtn").textContent = upd.ready ? "退出并更新到 v" + (upd.version || "") : "检查更新";
+  el("updateStatus").textContent = upd.status || "";
+  el("updateNotes").textContent = (upd.ready && upd.notes) ? "更新内容：\n" + upd.notes : "";
 
   setVal("java", s.game && s.game.java);
   setVal("jar", s.game && s.game.jar);
@@ -397,29 +336,6 @@ function render(s) {
   setVal("gameDir", s.game && s.game.gameDir);
   el("gameState").textContent = (s.game && s.game.state) || "";
   el("copyAddrBtn").disabled = !(s.game && s.game.addr);
-}
-
-function renderFriends(friends) {
-  var box = el("friendList");
-  if (!friends.length) {
-    box.innerHTML = '<div class="empty">还没有好友，先复制好友码发给朋友吧</div>';
-    return;
-  }
-  var html = "";
-  for (var i = 0; i < friends.length; i++) {
-    var f = friends[i];
-    var key = esc(f.key);
-    var name = esc(f.name);
-    html += '<div class="friend">'
-      + '<span class="name">' + name + '</span>'
-      + '<span class="badge ' + f.state + '">' + (STATE_LABEL[f.state] || f.state) + '</span>'
-      + '<button class="danger small" data-del="' + key + '">删除</button>'
-      + '</div>';
-  }
-  box.innerHTML = html;
-  box.querySelectorAll("[data-del]").forEach(function (b) {
-    b.addEventListener("click", function () { window.eliauk.action({ type: "deleteFriend", key: b.getAttribute("data-del") }); });
-  });
 }
 
 function renderRoom(room) {
@@ -451,14 +367,13 @@ function esc(t) {
 // buttons
 el("fullscreenBtn").addEventListener("click", function () { window.eliauk.action({ type: "fullscreen" }); });
 el("quitBtn").addEventListener("click", function () { window.eliauk.action({ type: "quit" }); });
-el("loginBtn").addEventListener("click", function () { window.eliauk.action({ type: "login", user: el("user").value, pass: el("pass").value }); });
-el("registerBtn").addEventListener("click", function () { window.eliauk.action({ type: "register", user: el("user").value, pass: el("pass").value }); });
-el("logoutBtn").addEventListener("click", function () { window.eliauk.action({ type: "logout" }); });
-el("copyBtn").addEventListener("click", function () { window.eliauk.action({ type: "copy", text: el("code").textContent }); });
-el("addBtn").addEventListener("click", function () { window.eliauk.action({ type: "addFriend", input: el("addInput").value }); el("addInput").value = ""; });
 el("createRoomBtn").addEventListener("click", function () { window.eliauk.action({ type: "roomCreate" }); });
 el("joinRoomBtn").addEventListener("click", function () { window.eliauk.action({ type: "roomJoin", code: el("joinCode").value }); el("joinCode").value = ""; });
 el("leaveRoomBtn").addEventListener("click", function () { window.eliauk.action({ type: "roomLeave" }); });
+el("copyRoomCodeBtn").addEventListener("click", function () {
+  var room = window._state && window._state.room;
+  if (room && room.code) window.eliauk.action({ type: "copy", text: room.code });
+});
 el("detectBtn").addEventListener("click", function () { window.eliauk.action({ type: "gameDetect" }); });
 el("startBtn").addEventListener("click", function () { window.eliauk.action({ type: "srvStart", java: el("java").value, jar: el("jar").value }); });
 el("stopBtn").addEventListener("click", function () { window.eliauk.action({ type: "srvStop" }); });
@@ -468,7 +383,11 @@ el("copyAddrBtn").addEventListener("click", function () {
 });
 el("mcAddBtn").addEventListener("click", function () { window.eliauk.action({ type: "mcAdd", gameDir: el("gameDir").value }); });
 el("launchBtn").addEventListener("click", function () { window.eliauk.action({ type: "launch", launcher: el("launcher").value }); });
-el("saveBtn").addEventListener("click", function () { window.eliauk.action({ type: "save", name: el("name").value, server: el("server").value }); });
+el("saveBtn").addEventListener("click", function () { window.eliauk.action({ type: "save", name: el("name").value, server: el("server").value, updateUrl: el("updateUrl").value }); });
+el("updateBtn").addEventListener("click", function () {
+  var upd = window._state && window._state.update;
+  window.eliauk.action({ type: (upd && upd.ready) ? "applyUpdate" : "checkUpdate" });
+});
 
 // fullscreen: F11 toggles, Escape exits when already fullscreen
 document.addEventListener("keydown", function (e) {
