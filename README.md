@@ -2,7 +2,7 @@
 
 像 Radmin VPN / ZeroTier 的 **P2P 虚拟局域网** —— 让跨公网的朋友像在同一个局域网里一样联机游戏（重点：**Minecraft**）。
 
-技术栈：**Go + Wintun（L3 虚拟网卡）**，加密与 GUI 全用标准库 / 纯 Win32，唯一外部依赖是 `gorilla/websocket`（信令传输）。
+技术栈：**Go + Wintun（L3 虚拟网卡）**，加密全用标准库，GUI 用 **WebView2（Edge Chromium）** 现代深色界面；外部依赖仅 `gorilla/websocket`（信令）与 `go-webview2`（宿主，复用系统 Edge 运行时，不打 150MB Chromium）。
 
 ---
 
@@ -37,7 +37,7 @@
 
 ## 📦 构建
 
-要求：Windows 10/11 + Go 1.27（编译时），运行仅需 `gui.exe` + `wintun.dll`。
+要求：Windows 10/11 + Go 1.27（编译时）；运行需 `gui.exe` + `wintun.dll` + **WebView2 运行时**（Win11 自带、Win10 随 Edge 预装；缺失时启动会提示安装）。
 
 ```powershell
 go build ./...
@@ -106,13 +106,14 @@ GUI 服务器地址填 **`wss://vpn.<你的域名>/ws`**。
 ```
 cmd/
   server/   # 协调服务器（WebSocket 信令 + 中继 + 账号/好友/房间）
-  gui/      # 傻瓜式主窗口 GUI（纯 Win32，零依赖）
+  gui/      # 傻瓜式主窗口 GUI（WebView2 / Edge Chromium，深色卡片主题）
   client/   # 交互式 CLI 客户端（调试用）
   mcprobe/  # 假 MC 服务端/客户端，测数据面
   genident/ # 生成/打印身份指纹
 internal/
   agent/    # 客户端核心（注册/STUN/打洞/隧道/虚拟网卡/房间），GUI 与 CLI 共用
-  window/   # 主窗口（原生控件 + 托盘，深色卡片主题）
+  webviewhost/ # WebView2 宿主 + Go↔JS 桥（状态推送 / 动作分发 / 关闭进托盘）
+  winutil/  # 剪贴板 / 提权 / 窗口显示隐藏与子类化（纯 syscall）
   tray/     # 纯 Win32 托盘
   p2p/      # UDP 打洞 + 加密隧道
   crypto/   # X25519 + HKDF + AES-256-GCM（stdlib）

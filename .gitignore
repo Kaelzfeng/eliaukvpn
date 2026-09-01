@@ -7,6 +7,7 @@ bin/
 # Local state
 *.log
 dist/
+accounts.json
 
 # Debug/test artifacts
 *.key

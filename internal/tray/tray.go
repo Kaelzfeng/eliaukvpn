@@ -16,6 +16,7 @@ package tray
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -50,6 +51,10 @@ const (
 	// Mouse-message lParam values delivered with CallbackMsg to a host window.
 	RButtonUp = wmRButtonUp
 	LDblClk   = wmLDblClk
+
+	// DblClickID is the synthetic Select() result for a double-click on the
+	// tray icon (distinct from any real menu command ID).
+	DblClickID = -1
 
 	nimAdd    = 0x00000000
 	nimModify = 0x00000001
@@ -233,6 +238,11 @@ func (t *Tray) wndProc(hwnd uintptr, m uint32, w, l uintptr) uintptr {
 		switch uint32(l) {
 		case wmRButtonUp: // right-click: show the context menu
 			t.showMenu()
+		case wmLDblClk: // double-click: open the main window
+			select {
+			case t.selCh <- DblClickID:
+			default:
+			}
 		}
 	case wmQuitAsk:
 		procPostQuitMessage.Call(0)
@@ -264,6 +274,7 @@ func (t *Tray) SetTooltip(s string) {
 // leaf item with a nonzero ID). Run must be called on the goroutine that
 // owns the window; it blocks until Stop.
 func (t *Tray) Run(onSelect func(id int)) error {
+	runtime.LockOSThread()
 	className, err := syscall.UTF16PtrFromString("EliaukTrayClass")
 	if err != nil {
 		return err

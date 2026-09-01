@@ -1,10 +1,10 @@
 //go:build windows
 
 // Command gui is the Eliauk VPN Windows application: a foolproof main window
-// with a resident tray icon. A non-technical user can double-click the exe,
-// fill in a nickname and server address, paste friends' codes, and play — no
-// command-line flags needed. Settings and friends persist to
-// %AppData%\Eliauk\config.json; the X25519 identity stays in its own keyfile.
+// (WebView2 / Edge Chromium) with a resident tray icon. A non-technical user can
+// double-click the exe, fill in a nickname and server address, paste friends'
+// codes, and play — no command-line flags needed. Settings and friends persist
+// to %AppData%\Eliauk\config.json; the X25519 identity stays in its own keyfile.
 //
 // It wraps the same headless agent as cmd/client (internal/agent); this file
 // only orchestrates config <-> agent <-> window/tray and the auto-reconnect
@@ -31,7 +31,8 @@ import (
 	"eliaukvpn/internal/p2p"
 	"eliaukvpn/internal/protocol"
 	"eliaukvpn/internal/tray"
-	"eliaukvpn/internal/window"
+	"eliaukvpn/internal/webviewhost"
+	"eliaukvpn/internal/winutil"
 )
 
 // Tray menu command IDs.
@@ -87,8 +88,8 @@ func run() error {
 		return fmt.Errorf("load identity: %w", err)
 	}
 
-	if *useVnic && !window.IsElevated() && !*noElevate {
-		if err := window.RelaunchElevated(); err == nil {
+	if *useVnic && !winutil.IsElevated() && !*noElevate {
+		if err := winutil.RelaunchElevated(); err == nil {
 			// The elevated copy has taken over (same command line); exit here.
 			return nil
 		}
@@ -147,60 +148,50 @@ func run() error {
 		}
 	}
 
-	win, err := window.New()
-	if err != nil {
-		return err
-	}
-	a.win = win
-
+	// Create the WebView2 host on a dedicated, LockOSThread'd goroutine; the
+	// window is created synchronously inside Run before it pumps messages.
+	ui := webviewhost.New()
+	a.ui = ui
 	runErrCh := make(chan error, 1)
-	go func() { runErrCh <- win.Run() }()
-	for win.Hwnd() == 0 {
-		select {
-		case err := <-runErrCh:
-			return fmt.Errorf("window: %v", err)
-		case <-time.After(10 * time.Millisecond):
-		}
+	go func() { runErrCh <- ui.Run() }()
+	select {
+	case <-ui.Ready():
+		// window up and bridge wired
+	case err := <-runErrCh:
+		return fmt.Errorf("webview: %v", err)
 	}
 
-	tr := tray.NewOnWindow(win.Hwnd())
-	a.tr = tr
-	tr.SetTooltip("Eliauk VPN — 连接中…")
-	tr.SetMenu([]tray.Item{
-		{Label: "打开窗口", ID: actOpen},
-		{Separator: true},
-		{Label: "退出 Eliauk VPN", ID: actQuit},
-	})
-	// Intercept the tray's callback message before wndProc. Left-click handling
-	// belongs to the tray; double-click restores the window.
-	win.SetMsgHook(func(m uint32, wParam, lParam uintptr) bool {
-		if m == tray.CallbackMsg {
-			if lParam == tray.LDblClk {
-				win.Show()
-			} else {
-				tr.HandleTrayMsg(lParam)
-			}
-			return true
-		}
-		return false
-	})
-	if err := tr.Add(); err != nil {
+	// Resident tray icon (self-pumping message-only window). If it can't be
+	// created the app still runs window-only.
+	tr, err := tray.New()
+	if err != nil {
 		log.Printf("tray: %v", err)
 	}
-
-	// Forward tray menu selections to a channel so the main loop can select on
-	// them alongside the window events.
-	selCh := make(chan int)
-	go func() {
-		for {
-			id, ok := tr.Select()
-			if !ok {
-				close(selCh)
-				return
-			}
-			selCh <- id
+	var selCh chan int
+	if tr != nil {
+		a.tr = tr
+		tr.SetTooltip("Eliauk VPN — 连接中…")
+		tr.SetMenu([]tray.Item{
+			{Label: "打开窗口", ID: actOpen},
+			{Separator: true},
+			{Label: "退出 Eliauk VPN", ID: actQuit},
+		})
+		if err := tr.Add(); err != nil {
+			log.Printf("tray: %v", err)
 		}
-	}()
+		go func() { _ = tr.Run(nil) }()
+		selCh = make(chan int)
+		go func() {
+			for {
+				id, ok := tr.Select()
+				if !ok {
+					close(selCh)
+					return
+				}
+				selCh <- id
+			}
+		}()
+	}
 
 	if *gameStartJar != "" {
 		go a.autoStartGame(*gameStartJar)
@@ -216,24 +207,35 @@ func run() error {
 
 	for {
 		select {
-		case ev := <-win.Events():
-			a.handleEvent(ev)
+		case act := <-ui.Actions():
+			a.handleAction(act)
 		case id, ok := <-selCh:
 			if !ok {
 				a.quit()
-			} else if id == actOpen {
-				win.Show()
+			} else if id == actOpen || id == tray.DblClickID {
+				ui.Show()
 			} else if id == actQuit {
 				a.quit()
 			}
+		case <-ui.Done():
+			// The window terminated without going through quit() (e.g. an
+			// external destroy); treat it as a shutdown request.
+			a.quit()
 		case <-exitTimer:
 			a.quit()
 		case <-a.quitCh:
-			win.Stop()
-			tr.Delete()
+			ui.Close()
 			select {
-			case <-win.Done():
+			case <-ui.Done():
 			case <-time.After(2 * time.Second):
+			}
+			if tr != nil {
+				tr.Stop()
+				select {
+				case <-tr.Done():
+				case <-time.After(2 * time.Second):
+				}
+				tr.Delete()
 			}
 			return nil
 		}
@@ -256,8 +258,9 @@ type app struct {
 	opts    options
 	myCode  string
 
-	win       *window.Window
+	ui        *webviewhost.Host
 	tr        *tray.Tray
+	uiReady   bool
 	restartCh chan struct{} // buffered 1: "settings changed, rebuild the agent"
 	quitCh    chan struct{}
 
@@ -277,10 +280,10 @@ type app struct {
 
 	// M7c game panel: remembered Java / server.jar paths, the running dedicated
 	// server process, and a short tail of its output (all under mu).
-	mcJava  string
-	mcJar   string
-	mcSrv   *mc.Server
-	mcTail  []string
+	mcJava string
+	mcJar  string
+	mcSrv  *mc.Server
+	mcTail []string
 
 	quitOnce sync.Once
 }
@@ -448,7 +451,8 @@ func (a *app) agentOptions() agent.Options {
 	}
 }
 
-// tickLoop repaints the window and the tray tooltip once a second.
+// tickLoop repaints the window once a second (once the frontend has signalled
+// ready) and persists any fresh session token.
 func (a *app) tickLoop() {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -456,8 +460,13 @@ func (a *app) tickLoop() {
 		select {
 		case <-tick.C:
 			a.maybePersistToken()
-			a.win.SetView(a.view())
 			trTooltip(a)
+			a.mu.Lock()
+			ready := a.uiReady
+			a.mu.Unlock()
+			if ready {
+				a.ui.Push(a.state())
+			}
 		case <-a.quitCh:
 			return
 		}
@@ -495,19 +504,22 @@ func (a *app) maybePersistToken() {
 	}
 }
 
-// view snapshots the current agent/config state into the window's renderable
-// model. When logged in to an M7 account the listbox mirrors the server-side
-// friend directory (row i ↔ directory[i], sorted by username); in legacy mode
-// it mirrors cfg.Friends (row i ↔ friend i). The delete button's listbox index
-// maps straight back to whichever list view() rendered.
-func (a *app) view() window.View {
+// state snapshots the current agent/config state into the frontend's renderable
+// model. When logged in to an M7 account the friend list mirrors the server-side
+// directory (card key ↔ KeyFP, sorted by username); in legacy mode it mirrors
+// cfg.Friends (card key ↔ Code). The delete button's card key maps straight back
+// to whichever list state() rendered.
+func (a *app) state() webviewhost.State {
 	a.mu.Lock()
 	cfg := *a.cfg
 	ag := a.ag
 	note, noteGood, noteAt := a.note, a.noteGood, a.noteAt
 	a.mu.Unlock()
 
-	v := window.View{Code: a.myCode, Name: cfg.Name, Server: cfg.Server}
+	s := webviewhost.State{
+		Code:     a.myCode,
+		Settings: webviewhost.Settings{Name: cfg.Name, Server: cfg.Server},
+	}
 
 	var st agent.Status
 	acct := ""
@@ -522,41 +534,46 @@ func (a *app) view() window.View {
 
 	switch {
 	case note != "" && time.Since(noteAt) < 4*time.Second:
-		v.Status, v.Good = note, noteGood
+		s.Status = webviewhost.StatusInfo{Text: note, Good: noteGood}
 	case cfg.Name == "" || cfg.Server == "":
-		v.Status = "请先填写昵称和服务器地址，然后点“保存并连接”"
+		s.Status = webviewhost.StatusInfo{Text: "请先填写昵称和服务器地址，然后点“保存并连接”"}
 	case ag == nil:
-		v.Status = "正在连接服务器…"
+		s.Status = webviewhost.StatusInfo{Text: "正在连接服务器…"}
 	default:
 		switch {
 		case st.VnicMsg != "":
-			v.Status = "虚拟网卡不可用：" + st.VnicMsg
+			s.Status = webviewhost.StatusInfo{Text: "虚拟网卡不可用：" + st.VnicMsg}
 		case st.Registered:
 			name := st.Name
 			if name == "" && acct != "" {
 				name = acct
 			}
-			v.Status = fmt.Sprintf("已连接 · %s · 虚拟IP %s", name, st.VirtualIP)
-			v.Good = true
+			s.Status = webviewhost.StatusInfo{Text: fmt.Sprintf("已连接 · %s · 虚拟IP %s", name, st.VirtualIP), Good: true}
 		default:
-			v.Status = "连接中…"
+			s.Status = webviewhost.StatusInfo{Text: "连接中…"}
 		}
 	}
+	s.Status.Dot = statusDot(s.Status)
 
 	// M7 account / room / hint lines.
-	v.Account = acct
-	v.LoggedIn = acct != ""
+	s.Account = acct
+	s.LoggedIn = acct != ""
 	if acct != "" {
-		v.AcctState = "当前账号：" + acct + " · 已登录"
-		v.AddHint = "输入对方的用户名（账号）即可添加"
+		s.AddHint = "输入对方的用户名（账号）即可添加"
 	} else {
-		v.AcctState = "未登录"
-		v.AddHint = "未登录：可粘贴好友码连接；登录后可按用户名加好友"
+		s.AddHint = "未登录：可粘贴好友码连接；登录后可按用户名加好友"
 	}
 	if ag != nil {
 		if room := ag.RoomState(); room != nil {
-			v.RoomState = fmt.Sprintf("房间：%s · %d 人", room.Code, len(room.Members))
-			v.RoomIn = true
+			s.Room.In = true
+			s.Room.Code = room.Code
+			for _, m := range room.Members {
+				s.Room.Members = append(s.Room.Members, webviewhost.RoomMember{
+					Username:  m.Username,
+					VirtualIP: m.VirtualIP,
+					Host:      m.Host,
+				})
+			}
 		}
 	}
 
@@ -564,92 +581,54 @@ func (a *app) view() window.View {
 	// dedicated server runs locally its address is our own virtual IP:25565;
 	// otherwise the room host's address is the one to join.
 	a.mu.Lock()
-	v.Java, v.Jar = a.mcJava, a.mcJar
+	s.Game.Java, s.Game.Jar = a.mcJava, a.mcJar
 	gameRunning := a.mcSrv != nil && a.mcSrv.Running()
 	a.mu.Unlock()
-	v.GameRunning = gameRunning
+	s.Game.Running = gameRunning
 	if addr := a.joinableAddr(); addr != "" {
+		s.Game.Addr = addr
 		if gameRunning {
-			v.GameState = "服务器运行中 · 可加入 " + addr
+			s.Game.State = "服务器运行中 · 可加入 " + addr
 		} else {
-			v.GameState = "未运行 · 可加入 " + addr
+			s.Game.State = "未运行 · 可加入 " + addr
 		}
 	} else if gameRunning {
-		v.GameState = "服务器运行中"
+		s.Game.State = "服务器运行中"
 	} else {
-		v.GameState = "未运行"
+		s.Game.State = "未运行"
 	}
 
 	online, conn := peerState(ag)
 	if acct != "" {
 		for _, f := range ag.FriendDirectory() {
-			v.Rows = append(v.Rows, accountFriendRow(f, conn))
+			s.Friends = append(s.Friends, accountFriendCard(f, conn))
 		}
 	} else {
 		for _, f := range cfg.Friends {
-			v.Rows = append(v.Rows, friendRow(f, online, conn))
+			s.Friends = append(s.Friends, friendCard(f, online, conn))
 		}
 	}
-	return v
+	return s
 }
 
-// peerState maps (lowercased) peer names to their online status and tunnel
-// connection state.
-func peerState(ag *agent.Agent) (online map[string]bool, conn map[string]p2p.State) {
-	online = make(map[string]bool)
-	conn = make(map[string]p2p.State)
-	if ag == nil {
-		return online, conn
+// statusDot maps a status line to its dot color: green when good, amber for an
+// in-flight "连接…" message, red otherwise.
+func statusDot(st webviewhost.StatusInfo) string {
+	if st.Good {
+		return "ok"
 	}
-	for _, p := range ag.Peers() {
-		online[strings.ToLower(p.Name)] = true
+	if strings.Contains(st.Text, "连接") {
+		return "busy"
 	}
-	for _, s := range ag.Snapshot() {
-		k := strings.ToLower(s.Name)
-		online[k] = true
-		conn[k] = s.State
-	}
-	return online, conn
-}
-
-// accountFriendRow renders one M7 account-directory friend. Presence comes from
-// the server (f.Online); the tunnel state overlays a stronger claim when a P2P
-// connection is actually up or in progress.
-func accountFriendRow(f protocol.Friend, conn map[string]p2p.State) string {
-	switch conn[strings.ToLower(f.Username)] {
-	case p2p.StateConnected:
-		return f.Username + " — 已连接"
-	case p2p.StateConnecting:
-		return f.Username + " — 连接中"
-	}
-	if f.Online {
-		return f.Username + " — 在线"
-	}
-	return f.Username + " — 离线"
-}
-
-// friendRow renders one friend as a listbox line with its live state.
-func friendRow(f config.Friend, online map[string]bool, conn map[string]p2p.State) string {
-	name := strings.TrimSpace(f.Name)
-	if name == "" {
-		name = "(未命名)"
-	}
-	key := strings.ToLower(strings.TrimSpace(f.Name))
-	switch conn[key] {
-	case p2p.StateConnected:
-		return name + " — 已连接"
-	case p2p.StateConnecting:
-		return name + " — 连接中"
-	}
-	if online[key] {
-		return name + " — 在线"
-	}
-	return name + " — 离线"
+	return "warn"
 }
 
 // trTooltip updates the tray tooltip from the live agent state (notes are not
 // shown in the tooltip).
 func trTooltip(a *app) {
+	if a.tr == nil {
+		return
+	}
 	a.mu.Lock()
 	ag := a.ag
 	cfg := *a.cfg
@@ -673,43 +652,112 @@ func trTooltip(a *app) {
 	}
 }
 
-// handleEvent applies one window action to config and the live agent.
-func (a *app) handleEvent(ev window.EvMsg) {
-	switch ev.Type {
-	case window.EvCopy:
-		window.CopyToClipboard(a.win.Hwnd(), a.myCode)
-		a.setNote("好友码已复制到剪贴板", true)
-	case window.EvAdd:
-		a.addFriend(ev.Text)
-	case window.EvDelete:
-		a.deleteFriend(ev.Index)
-	case window.EvSave:
-		a.saveSettings(ev.Text, ev.Text2)
-	case window.EvQuit:
+// peerState maps (lowercased) peer names to their online status and tunnel
+// connection state.
+func peerState(ag *agent.Agent) (online map[string]bool, conn map[string]p2p.State) {
+	online = make(map[string]bool)
+	conn = make(map[string]p2p.State)
+	if ag == nil {
+		return online, conn
+	}
+	for _, p := range ag.Peers() {
+		online[strings.ToLower(p.Name)] = true
+	}
+	for _, s := range ag.Snapshot() {
+		k := strings.ToLower(s.Name)
+		online[k] = true
+		conn[k] = s.State
+	}
+	return online, conn
+}
+
+// accountFriendCard renders one M7 account-directory friend. Presence comes from
+// the server (f.Online); the tunnel state overlays a stronger claim when a P2P
+// connection is actually up or in progress. The card key is the stable KeyFP.
+func accountFriendCard(f protocol.Friend, conn map[string]p2p.State) webviewhost.FriendCard {
+	c := webviewhost.FriendCard{Key: f.KeyFP, Name: f.Username, Online: f.Online}
+	switch conn[strings.ToLower(f.Username)] {
+	case p2p.StateConnected:
+		c.State = "connected"
+	case p2p.StateConnecting:
+		c.State = "connecting"
+	default:
+		if f.Online {
+			c.State = "online"
+		} else {
+			c.State = "offline"
+		}
+	}
+	return c
+}
+
+// friendCard renders one legacy friend with its live state. The card key is the
+// friend's fingerprint code.
+func friendCard(f config.Friend, online map[string]bool, conn map[string]p2p.State) webviewhost.FriendCard {
+	name := strings.TrimSpace(f.Name)
+	if name == "" {
+		name = "(未命名)"
+	}
+	key := strings.ToLower(strings.TrimSpace(f.Name))
+	c := webviewhost.FriendCard{Key: f.Code, Name: name}
+	switch conn[key] {
+	case p2p.StateConnected:
+		c.State = "connected"
+	case p2p.StateConnecting:
+		c.State = "connecting"
+	default:
+		if online[key] {
+			c.State = "online"
+		} else {
+			c.State = "offline"
+		}
+	}
+	return c
+}
+
+// handleAction applies one frontend action to config and the live agent.
+func (a *app) handleAction(act webviewhost.Action) {
+	switch act.Type {
+	case webviewhost.ActReady:
+		log.Printf("webview: frontend ready")
+		a.mu.Lock()
+		a.uiReady = true
+		a.mu.Unlock()
+		a.ui.Push(a.state())
+	case webviewhost.ActCopy:
+		winutil.CopyToClipboard(a.ui.Window(), act.Text)
+		a.setNote("已复制到剪贴板", true)
+	case webviewhost.ActAddFriend:
+		a.addFriend(act.Input)
+	case webviewhost.ActDeleteFriend:
+		a.deleteFriend(act.Key)
+	case webviewhost.ActSave:
+		a.saveSettings(act.Name, act.Server)
+	case webviewhost.ActQuit:
 		a.quit()
-	case window.EvLogin:
-		a.doAuth(ev.Text, ev.Text2, false)
-	case window.EvRegister:
-		a.doAuth(ev.Text, ev.Text2, true)
-	case window.EvLogout:
+	case webviewhost.ActLogin:
+		a.doAuth(act.User, act.Pass, false)
+	case webviewhost.ActRegister:
+		a.doAuth(act.User, act.Pass, true)
+	case webviewhost.ActLogout:
 		a.logout()
-	case window.EvRoomCreate:
+	case webviewhost.ActConnect:
+		a.connectPeer(act.Name)
+	case webviewhost.ActRoomCreate:
 		a.roomAction(func(ag *agent.Agent) error { return ag.CreateRoom() }, "已创建房间", true)
-	case window.EvRoomJoin:
-		a.roomAction(func(ag *agent.Agent) error { return ag.JoinRoom(ev.Text) }, "已加入房间", true)
-	case window.EvRoomLeave:
+	case webviewhost.ActRoomJoin:
+		a.roomAction(func(ag *agent.Agent) error { return ag.JoinRoom(act.Code) }, "已加入房间", true)
+	case webviewhost.ActRoomLeave:
 		a.roomAction(func(ag *agent.Agent) error { return ag.LeaveRoom() }, "已离开房间", true)
-	case window.EvGameDetect:
+	case webviewhost.ActGameDetect:
 		a.detectGame()
-	case window.EvSrvStart:
-		a.startGame(ev.Text, ev.Text2)
-	case window.EvSrvStop:
+	case webviewhost.ActSrvStart:
+		a.startGame(act.Java, act.Jar)
+	case webviewhost.ActSrvStop:
 		a.stopGame()
-	case window.EvSrvCopy:
-		a.copyGameAddr()
-	case window.EvMCAdd:
+	case webviewhost.ActMCAdd:
 		a.addToLauncher()
-	case window.EvLaunch:
+	case webviewhost.ActLaunch:
 		a.launchGame()
 	}
 }
@@ -757,9 +805,9 @@ func (a *app) addFriend(input string) {
 	a.setNote("已添加好友", true)
 }
 
-// deleteFriend removes the friend at listbox row idx. The row source matches
-// view(): the account friend directory when logged in, config friends otherwise.
-func (a *app) deleteFriend(idx int) {
+// deleteFriend removes the friend identified by the stable card key. The key
+// source matches state(): KeyFP (account directory) or Code (legacy config).
+func (a *app) deleteFriend(key string) {
 	a.mu.Lock()
 	ag := a.ag
 	acct := loggedInAccount(ag)
@@ -768,33 +816,53 @@ func (a *app) deleteFriend(idx int) {
 		if ag == nil {
 			return
 		}
-		dir := ag.FriendDirectory()
-		if idx < 0 || idx >= len(dir) {
-			return
+		// Resolve the KeyFP back to its username (the directory is what the
+		// server removes by name).
+		var uname string
+		for _, f := range ag.FriendDirectory() {
+			if f.KeyFP == key {
+				uname = f.Username
+				break
+			}
 		}
-		if err := ag.RemoveFriendByName(dir[idx].Username); err != nil {
+		if uname == "" {
+			uname = key // defensive: treat the key as the username directly
+		}
+		if err := ag.RemoveFriendByName(uname); err != nil {
 			a.setNote(err.Error(), false)
 			return
 		}
 		a.setNote("已删除好友", true)
 		return
 	}
+	// Legacy fingerprint mode: key IS the friend's code.
 	a.mu.Lock()
-	if idx < 0 || idx >= len(a.cfg.Friends) {
-		a.mu.Unlock()
-		return
-	}
-	f := a.cfg.Friends[idx]
-	a.cfg.RemoveFriend(f.Code)
+	a.cfg.RemoveFriend(key)
 	a.mu.Unlock()
 	if err := a.cfg.Save(a.cfgPath); err != nil {
 		a.setNote("保存配置失败："+err.Error(), false)
 		return
 	}
 	if ag != nil {
-		_ = ag.RemoveFriend(f.Code)
+		_ = ag.RemoveFriend(key)
 	}
 	a.setNote("已删除好友", true)
+}
+
+// connectPeer triggers an explicit P2P connect to the named peer.
+func (a *app) connectPeer(name string) {
+	a.mu.Lock()
+	ag := a.ag
+	a.mu.Unlock()
+	if ag == nil {
+		a.setNote("尚未连接服务器", false)
+		return
+	}
+	if err := ag.Connect(name); err != nil {
+		a.setNote(err.Error(), false)
+		return
+	}
+	a.setNote("正在连接 "+name+" …", true)
 }
 
 // loggedInAccount returns the authenticated username of ag, or "" when the
@@ -1002,17 +1070,6 @@ func (a *app) stopGame() {
 	}
 	srv.Stop()
 	a.setNote("服务器已停止", true)
-}
-
-// copyGameAddr copies the current joinable address to the clipboard.
-func (a *app) copyGameAddr() {
-	addr := a.joinableAddr()
-	if addr == "" {
-		a.setNote("暂无可复制的地址：请先启动服务器，或加入有房主的房间", false)
-		return
-	}
-	window.CopyToClipboard(a.win.Hwnd(), addr)
-	a.setNote("已复制 "+addr, true)
 }
 
 // addToLauncher registers the current joinable address in the official

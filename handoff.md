@@ -26,6 +26,7 @@
 - [x] **M7b 完成（2026-08-31）**：MCTier 式改造第②档 — 房间系统（一键加入）。5 位房间码（32 字符表，无 I/O/0/1），加入即互白名单 + 互见 + 自动打洞（**不是好友也能直连**）；离开/掉线自动退房；修了「退房者永远不知道已退」的 bug（新增 `room_left` 消息）。
 - [x] **M7c 完成（2026-08-31）**：MCTier 式改造第③档 — 游戏启动器集成。`internal/mc`（纯 stdlib）：检测 Java/.minecraft/服务器 jar/官方启动器；一键开服（写 eula.txt + 合并 server.properties + `java -jar server.jar nogui`，stdin 输 stop 优雅关服）；servers.dat 的 NBT 注入（gzip→解析→合并{name,ip}→回写，备份 .bak，保留原有条目）；GUI「游戏」面板（Java/jar 自动检测、开服/停服、复制房主地址、添加到启动器、启动游戏）。房主地址 = 房间 Host 的虚拟 IP:25565（`RoomMember.Host` 标记已上线）
 - [x] **UI 焕新完成（2026-09-01）**：深色模式 + 全面焕新（`internal/window/theme.go` 新增，提交 `31f850c` 已推送）— 深色背景 + 六张圆角卡片、靛蓝主题色（#6C5CE7）、owner-draw 按钮（悬停/按下反馈，subclass + TrackMouseEvent）、连接状态指示灯（绿/灰/红三态，`idcStatusDot`）、Segoe UI 字体族、深色标题栏（`DwmSetWindowAttribute` DWMWA_USE_IMMERSIVE_DARK_MODE）。纯 Win32/GDI，零第三方依赖。验证：像素采样 10 点全对 + build/vet/test + e2e-gui.ps1 三阶段全绿。
+- [x] **WebView2 GUI 重写完成（2026-09-01）**：纯 Win32/GDI 主窗口太「远古」且偶发「未响应」→ 整体换成 **WebView2（Edge Chromium）桌面应用**（同 oopz/KOOK/Discord 路线，复用 Win11 预装 Edge 运行时、不打 150MB Chromium）。新增 `internal/webviewhost`（宿主 + Go↔JS 桥）+ `internal/winutil`（剪贴板/提权/窗口显示隐藏与子类化）；**删除 `internal/window`**；托盘改 `tray.New()` 自泵（`LockOSThread`）+ 双击开窗；关闭/最小化子类化成进托盘。`go get github.com/jchv/go-webview2`（go-winloader 内嵌 `WebView2Loader.dll`，无 sidecar）。**核心 `internal/agent`/`protocol`/`mc`/`p2p`/`crypto`/`server` 零改动**。详见「WebView2 重写详情」。
 
 ## M2 详情（含踩坑）
 - 架构：协调服务器交换 candidates（`connect_request` → 双向 `connect_candidates`），双方在同一 socket 上各自打洞。
@@ -73,7 +74,7 @@
   `go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网IP>:9091 -accounts <账号目录.json>`
   （注意：本机 8080/8081 被遗留进程占用，测试一律用 9090/9091。不带 `-accounts` 时账号功能不可用，legacy 匿名模式仍可跑。）
 - **交互式 CLI 客户端**（调试打洞用）：`bin/client.exe -name host -server ws://<server>:9090/ws [-vnic]`
-- **傻瓜式 GUI**（正式使用，M6d+M7，UI 焕新后深色卡片界面）：双击 `bin/gui.exe` 即可。首次使用在主窗口填「昵称」+「服务器地址」（形如 `ws://主机:9090/ws`）点「保存并连接」。M7 之后推荐**注册账号**：在「账号」组输用户名+密码点「注册」，再点「登录」（登录后 session token 缓存到 config，重启免密）；「好友」组按用户名加好友；「房间」组创建房间 → 把 5 位房间码发给朋友 → 朋友输入房间码点「加入房间」即**自动互连**（不用互加好友）。「游戏」组：自动检测 Java/服务器 jar →「启动服务器」开服 →「复制地址」把房主地址（虚拟 IP:25565）发给朋友 → 朋友「添加服务器」写进启动器多人在线列表即可一键加入。设置与好友持久化到 `%AppData%\Eliauk\config.json`（`-config` 可覆盖路径），X25519 身份在 `identity.key`。GUI 默认尝试 UAC 提权自重启以建虚拟网卡（`-no-elevate` 跳过）。release 无控制台版：`go build -ldflags "-H windowsgui" ./cmd/gui`。
+- **傻瓜式 GUI**（正式使用，M6d+M7，WebView2 深色卡片界面）：双击 `bin/gui.exe` 即可（需系统 WebView2 运行时，Win11 自带）。首次使用在主窗口填「昵称」+「服务器地址」（形如 `ws://主机:9090/ws`）点「保存并连接」。M7 之后推荐**注册账号**：在「账号」组输用户名+密码点「注册」，再点「登录」（登录后 session token 缓存到 config，重启免密）；「好友」组按用户名加好友；「房间」组创建房间 → 把 5 位房间码发给朋友 → 朋友输入房间码点「加入房间」即**自动互连**（不用互加好友）。「游戏」组：自动检测 Java/服务器 jar →「启动服务器」开服 →「复制地址」把房主地址（虚拟 IP:25565）发给朋友 → 朋友「添加服务器」写进启动器多人在线列表即可一键加入。设置与好友持久化到 `%AppData%\Eliauk\config.json`（`-config` 可覆盖路径），X25519 身份在 `identity.key`。GUI 默认尝试 UAC 提权自重启以建虚拟网卡（`-no-elevate` 跳过）。release 无控制台版：`go build -ldflags "-H windowsgui" ./cmd/gui`。
   **自动化钩子**（测试用）：`-exit-after <dur>` 到时自动退出；`-vnic-name` 指定网卡名；`-debug-packets` 打数据面日志；`-account`/`-password`/`-create-account` 无头登录/注册（带密码即清 token 强制走密码，不带密码用缓存的 token 登录）；`-game-start <jar>` agent 注册后自动开服。`cmd/genident <keyfile>` 打印/生成身份指纹（e2e 脚本用）。
 - **CLI 一键互连（不带 GUI，测试白名单用）**：`cmd/genident` 生成两端指纹 → 各自写 `--friends` 文件（每行一个指纹，`#` 注释）→ `bin/client.exe -name host -server ws://… -vnic --friends friends.txt`。
 - **M9 跨机验证步骤**（真机双端）：
