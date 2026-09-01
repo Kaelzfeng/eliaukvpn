@@ -45,6 +45,12 @@ const (
 // Override at build time with: go build -ldflags "-X main.version=1.2.3".
 var version = "1.0.0"
 
+// defaultServer is the coordination-server WebSocket URL pre-filled into the
+// settings on a fresh install (when no server has been saved yet), so the app
+// can connect out of the box instead of demanding a hand-typed address.
+// Override at build time with: go build -ldflags "-X main.defaultServer=wss://…".
+var defaultServer = "wss://vpn.kaelzfeng.uk/ws"
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -89,6 +95,11 @@ func run() error {
 	}
 	if *serverAddr != "" {
 		cfg.Server = *serverAddr
+	}
+	// A fresh install has no server saved: fall back to the bundled default so
+	// the app can connect immediately (the user only needs to pick a nickname).
+	if cfg.Server == "" {
+		cfg.Server = defaultServer
 	}
 
 	// Load the identity up front so the friend code shows even before the
@@ -557,8 +568,10 @@ func (a *app) state() webviewhost.State {
 	switch {
 	case note != "" && time.Since(noteAt) < 4*time.Second:
 		s.Status = webviewhost.StatusInfo{Text: note, Good: noteGood}
-	case cfg.Name == "" || cfg.Server == "":
-		s.Status = webviewhost.StatusInfo{Text: "请先填写昵称和服务器地址，然后点“保存并连接”"}
+	case cfg.Name == "":
+		s.Status = webviewhost.StatusInfo{Text: "请先填写昵称，然后点“保存并连接”"}
+	case cfg.Server == "":
+		s.Status = webviewhost.StatusInfo{Text: "请先填写服务器地址，然后点“保存并连接”"}
 	case ag == nil:
 		s.Status = webviewhost.StatusInfo{Text: "正在连接服务器…"}
 	default:
@@ -911,6 +924,15 @@ func (a *app) doAuth(user, pass string, create bool) {
 	user = strings.TrimSpace(user)
 	if user == "" || pass == "" {
 		a.setNote("账号和密码都不能为空", false)
+		return
+	}
+	// Registering/loginning needs a live agent, which only starts once a name
+	// and server are saved. Surface the real blocker instead of a silent no-op.
+	a.mu.Lock()
+	name, server := a.cfg.Name, a.cfg.Server
+	a.mu.Unlock()
+	if name == "" || server == "" {
+		a.setNote("请先在「设置」填写昵称并点“保存并连接”", false)
 		return
 	}
 	a.mu.Lock()

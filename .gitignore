@@ -3,6 +3,7 @@ bin/
 *.exe
 *.test
 *.out
+wintun.dll
 
 # Local state
 *.log

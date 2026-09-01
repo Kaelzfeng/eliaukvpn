@@ -37,11 +37,13 @@
 
 ## 📦 构建
 
-要求：Windows 10/11 + Go 1.27（编译时）；运行需 `gui.exe` + `wintun.dll` + **WebView2 运行时**（Win11 自带、Win10 随 Edge 预装；缺失时启动会提示安装）。
+要求：Windows 10/11 + Go 1.27（编译时）；运行需 `eliaukvpn.exe` + `wintun.dll` + **WebView2 运行时**（Win11 自带、Win10 随 Edge 预装；缺失时启动会提示安装）。
 
 ```powershell
 go build ./...
-go build -ldflags "-H windowsgui" ./cmd/gui   # 无控制台的 GUI 版本
+powershell -File build.ps1   # 一键构建发行版 eliaukvpn.exe（可 `build.ps1 1.2.3` 打版本号）
+# 或手动构建：
+go build -ldflags "-H windowsgui" -o eliaukvpn.exe ./cmd/gui
 ```
 
 ## 🚀 快速开始
@@ -57,9 +59,9 @@ go run ./cmd/server -addr :9090 -relay-listen 0.0.0.0:9091 -relay-public <公网
 
 ### 2. 启动 GUI
 
-双击 `bin/gui.exe`（或 `go run ./cmd/gui`），主窗口里：
+双击 `eliaukvpn.exe`（或 `go run ./cmd/gui`），主窗口里：
 
-1. 填「昵称」+「服务器地址」`ws://<主机>:9090/ws` → 「保存并连接」。
+1. 填「昵称」（服务器地址默认已填 `wss://vpn.kaelzfeng.uk/ws`，可改成你自己的）→ 「保存并连接」。
 2. 「账号」组注册 → 登录（Token 缓存到 config，重启免密）。
 3. 「好友」组按用户名加好友，或「房间」组创建房间 → 把 5 位房间码发给朋友加入。
 4. 「游戏」组一键开服 → 「复制地址」发给朋友 → 朋友「添加服务器」进 Minecraft 列表。
