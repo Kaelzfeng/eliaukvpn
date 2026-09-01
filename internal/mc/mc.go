@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ---- detection ----
@@ -229,9 +230,10 @@ func FindServerJar() string {
 
 // Server is one running `java -jar server.jar nogui` process.
 type Server struct {
-	mu  sync.Mutex
-	cmd *exec.Cmd
-	in  io.WriteCloser
+	mu   sync.Mutex
+	cmd  *exec.Cmd
+	in   io.WriteCloser
+	done chan struct{} // closed when the server process exits
 }
 
 // PrepareServerDir writes eula.txt (accept) and merges server.properties so a
@@ -306,7 +308,10 @@ func StartServer(java, jar string, logf func(string)) (*Server, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("启动服务器失败: %w", err)
 	}
-	s := &Server{cmd: cmd, in: in}
+	s := &Server{cmd: cmd, in: in, done: make(chan struct{})}
+	// Reap the process so Running() can observe it exiting (and so we don't leak
+	// the handle); the scan goroutines above drain its output to EOF.
+	go func() { _ = cmd.Wait(); close(s.done) }()
 	go scanLines(stdout, logf)
 	go scanLines(stderr, logf)
 	return s, nil
@@ -316,21 +321,37 @@ func StartServer(java, jar string, logf func(string)) (*Server, error) {
 func (s *Server) Running() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cmd != nil && s.cmd.ProcessState == nil
+	if s.cmd == nil {
+		return false
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+		return true
+	}
 }
 
 // Stop asks the server to shut down gracefully ("stop" on stdin so the world
-// saves), falling back to a kill after a short grace period.
+// saves), then force-kills it if it hasn't exited within a grace period.
 func (s *Server) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cmd == nil || s.cmd.Process == nil {
+	cmd := s.cmd
+	in := s.in
+	done := s.done
+	s.mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	if s.in != nil {
-		_, _ = io.WriteString(s.in, "stop\n")
+	if in != nil {
+		_, _ = io.WriteString(in, "stop\n")
 	}
-	_ = s.cmd.Process.Kill()
+	select {
+	case <-done:
+		return // exited gracefully after saving the world
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+	}
 }
 
 // LaunchLauncher starts the user's Minecraft launcher: PCL when detected,
