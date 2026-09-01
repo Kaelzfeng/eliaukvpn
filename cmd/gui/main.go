@@ -365,7 +365,10 @@ func (a *app) signalRestart() {
 func (a *app) agentLoop() {
 	for {
 		a.mu.Lock()
-		hasCfg := a.cfg.Name != "" && a.cfg.Server != ""
+		// The agent starts when a server is set and there's a display name OR an
+		// account to identify as (an empty name falls back to the account name
+		// inside the agent). Legacy (no-account) mode still needs a nickname.
+		hasCfg := a.cfg.Server != "" && (a.cfg.Name != "" || a.cfg.Account != "")
 		a.mu.Unlock()
 
 		if !hasCfg {
@@ -568,7 +571,7 @@ func (a *app) state() webviewhost.State {
 	switch {
 	case note != "" && time.Since(noteAt) < 4*time.Second:
 		s.Status = webviewhost.StatusInfo{Text: note, Good: noteGood}
-	case cfg.Name == "":
+	case cfg.Name == "" && cfg.Account == "":
 		s.Status = webviewhost.StatusInfo{Text: "请先填写昵称，然后点“保存并连接”"}
 	case cfg.Server == "":
 		s.Status = webviewhost.StatusInfo{Text: "请先填写服务器地址，然后点“保存并连接”"}
@@ -670,7 +673,7 @@ func trTooltip(a *app) {
 	cfg := *a.cfg
 	a.mu.Unlock()
 	switch {
-	case cfg.Name == "" || cfg.Server == "":
+	case cfg.Server == "" || (cfg.Name == "" && cfg.Account == ""):
 		a.tr.SetTooltip("Eliauk VPN — 未连接")
 	case ag == nil:
 		a.tr.SetTooltip("Eliauk VPN — 连接中…")
@@ -908,13 +911,17 @@ func (a *app) doAuth(user, pass string, create bool) {
 		a.setNote("账号和密码都不能为空", false)
 		return
 	}
-	// Registering/loginning needs a live agent, which only starts once a name
-	// and server are saved. Surface the real blocker instead of a silent no-op.
+	// A fresh install has no nickname yet; the account username doubles as the
+	// display name (the agent does the same fallback) so registering/logging in
+	// works without a separate 设置 step.
 	a.mu.Lock()
-	name, server := a.cfg.Name, a.cfg.Server
+	if a.cfg.Name == "" {
+		a.cfg.Name = user
+	}
+	server := a.cfg.Server
 	a.mu.Unlock()
-	if name == "" || server == "" {
-		a.setNote("请先在「设置」填写昵称并点“保存并连接”", false)
+	if server == "" {
+		a.setNote("请先在「设置」填写服务器地址并点“保存并连接”", false)
 		return
 	}
 	a.mu.Lock()
