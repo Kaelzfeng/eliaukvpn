@@ -413,14 +413,10 @@ function renderFriends(friends) {
     html += '<div class="friend">'
       + '<span class="name">' + name + '</span>'
       + '<span class="badge ' + f.state + '">' + (STATE_LABEL[f.state] || f.state) + '</span>'
-      + '<button class="ghost small" data-connect="' + key + '" ' + (f.online ? "" : "disabled") + '>连接</button>'
       + '<button class="danger small" data-del="' + key + '">删除</button>'
       + '</div>';
   }
   box.innerHTML = html;
-  box.querySelectorAll("[data-connect]").forEach(function (b) {
-    b.addEventListener("click", function () { window.eliauk.action({ type: "connect", name: b.getAttribute("data-connect") }); });
-  });
   box.querySelectorAll("[data-del]").forEach(function (b) {
     b.addEventListener("click", function () { window.eliauk.action({ type: "deleteFriend", key: b.getAttribute("data-del") }); });
   });

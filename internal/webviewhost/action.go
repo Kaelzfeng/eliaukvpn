@@ -30,7 +30,6 @@ const (
 	ActLogout       = "logout"
 	ActAddFriend    = "addFriend"
 	ActDeleteFriend = "deleteFriend"
-	ActConnect      = "connect"
 	ActRoomCreate   = "roomCreate"
 	ActRoomJoin     = "roomJoin"
 	ActRoomLeave    = "roomLeave"

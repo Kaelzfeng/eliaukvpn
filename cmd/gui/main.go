@@ -777,8 +777,6 @@ func (a *app) handleAction(act webviewhost.Action) {
 		a.doAuth(act.User, act.Pass, true)
 	case webviewhost.ActLogout:
 		a.logout()
-	case webviewhost.ActConnect:
-		a.connectPeer(act.Name)
 	case webviewhost.ActRoomCreate:
 		a.roomAction(func(ag *agent.Agent) error { return ag.CreateRoom() }, "已创建房间", true)
 	case webviewhost.ActRoomJoin:
@@ -886,22 +884,6 @@ func (a *app) deleteFriend(key string) {
 		_ = ag.RemoveFriend(key)
 	}
 	a.setNote("已删除好友", true)
-}
-
-// connectPeer triggers an explicit P2P connect to the named peer.
-func (a *app) connectPeer(name string) {
-	a.mu.Lock()
-	ag := a.ag
-	a.mu.Unlock()
-	if ag == nil {
-		a.setNote("尚未连接服务器", false)
-		return
-	}
-	if err := ag.Connect(name); err != nil {
-		a.setNote(err.Error(), false)
-		return
-	}
-	a.setNote("正在连接 "+name+" …", true)
 }
 
 // loggedInAccount returns the authenticated username of ag, or "" when the
