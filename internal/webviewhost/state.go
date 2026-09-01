@@ -51,15 +51,16 @@ type Settings struct {
 
 // State is the full renderable state pushed to the frontend.
 type State struct {
-	Status   StatusInfo   `json:"status"`
-	Code     string       `json:"code"`
-	Account  string       `json:"account"`
-	LoggedIn bool         `json:"loggedIn"`
-	AddHint  string       `json:"addHint"`
-	Settings Settings     `json:"settings"`
-	Friends  []FriendCard `json:"friends"`
-	Room     RoomInfo     `json:"room"`
-	Game     GameInfo     `json:"game"`
+	Status     StatusInfo   `json:"status"`
+	Fullscreen bool         `json:"fullscreen"`
+	Code       string       `json:"code"`
+	Account    string       `json:"account"`
+	LoggedIn   bool         `json:"loggedIn"`
+	AddHint    string       `json:"addHint"`
+	Settings   Settings     `json:"settings"`
+	Friends    []FriendCard `json:"friends"`
+	Room       RoomInfo     `json:"room"`
+	Game       GameInfo     `json:"game"`
 }
 
 // MarshalState encodes state to JSON.

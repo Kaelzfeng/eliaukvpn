@@ -38,6 +38,7 @@ const (
 	ActCopy         = "copy"
 	ActMCAdd        = "mcAdd"
 	ActLaunch       = "launch"
+	ActFullscreen   = "fullscreen"
 )
 
 // ParseAction decodes a frontend action from its JSON form.

@@ -517,8 +517,9 @@ func (a *app) state() webviewhost.State {
 	a.mu.Unlock()
 
 	s := webviewhost.State{
-		Code:     a.myCode,
-		Settings: webviewhost.Settings{Name: cfg.Name, Server: cfg.Server},
+		Fullscreen: a.ui.Fullscreen(),
+		Code:       a.myCode,
+		Settings:   webviewhost.Settings{Name: cfg.Name, Server: cfg.Server},
 	}
 
 	var st agent.Status
@@ -759,6 +760,9 @@ func (a *app) handleAction(act webviewhost.Action) {
 		a.addToLauncher()
 	case webviewhost.ActLaunch:
 		a.launchGame()
+	case webviewhost.ActFullscreen:
+		a.ui.ToggleFullscreen()
+		a.ui.Push(a.state())
 	}
 }
 

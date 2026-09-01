@@ -35,6 +35,10 @@ type Host struct {
 	prevWndProc uintptr // original wndProc, chained to by hostWndProc
 	subCB       uintptr // keep-alive for the subclass callback
 
+	mu         sync.Mutex
+	fullscreen bool
+	fs         winutil.Fullscreen
+
 	readyOnce sync.Once
 	doneOnce  sync.Once
 }
@@ -73,7 +77,7 @@ func (h *Host) Run() error {
 	}
 	h.w = w
 	w.SetTitle("Eliauk VPN")
-	w.SetSize(560, 860, webview2.HintFixed)
+	w.SetSize(1080, 720, webview2.HintNone)
 	if err := w.Bind("eliaukAction", h.handleAction); err != nil {
 		return err
 	}
@@ -114,6 +118,27 @@ func (h *Host) Hide() {
 		return
 	}
 	h.w.Dispatch(func() { winutil.ShowWindow(h.hwnd, winutil.SWHide) })
+}
+
+// ToggleFullscreen flips the window between normal and borderless fullscreen.
+// The flag flips synchronously so a Push immediately after reflects it; the
+// Win32 work is marshaled onto the UI thread.
+func (h *Host) ToggleFullscreen() {
+	if h.w == nil {
+		return
+	}
+	h.mu.Lock()
+	h.fullscreen = !h.fullscreen
+	enter := h.fullscreen
+	h.mu.Unlock()
+	h.w.Dispatch(func() { h.fs.Set(h.hwnd, enter) })
+}
+
+// Fullscreen reports whether the window is currently fullscreen.
+func (h *Host) Fullscreen() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.fullscreen
 }
 
 // subclassWndProc installs hostWndProc as the window procedure so closing or

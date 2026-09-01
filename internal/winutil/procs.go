@@ -21,7 +21,13 @@ var (
 	procShowWindow          = user32.NewProc("ShowWindow")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procSetWindowLongPtrW   = user32.NewProc("SetWindowLongPtrW")
+	procGetWindowLongPtrW   = user32.NewProc("GetWindowLongPtrW")
 	procCallWindowProcW     = user32.NewProc("CallWindowProcW")
+	procGetWindowPlacement  = user32.NewProc("GetWindowPlacement")
+	procSetWindowPlacement  = user32.NewProc("SetWindowPlacement")
+	procMonitorFromWindow   = user32.NewProc("MonitorFromWindow")
+	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
+	procSetWindowPos        = user32.NewProc("SetWindowPos")
 
 	procGetModuleFileNameW = kernel32.NewProc("GetModuleFileNameW")
 	procGetCommandLineW    = kernel32.NewProc("GetCommandLineW")

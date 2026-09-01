@@ -10,51 +10,106 @@
   html, body { height: 100%; }
   body {
     font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
-    background: #1E1F22; color: #EDEFF3; overflow-y: auto;
+    background: #1E1F22; color: #EDEFF3; overflow: hidden;
     -webkit-user-select: none; user-select: none;
   }
   input, button, textarea { -webkit-user-select: text; user-select: text; }
+  button { font-family: inherit; }
 
-  .app { max-width: 560px; margin: 0 auto; padding: 20px 18px 28px; }
+  .shell { display: flex; height: 100vh; }
 
-  /* header */
-  .header { margin-bottom: 16px; }
-  .title-row { display: flex; align-items: center; justify-content: space-between; }
-  .title { font-size: 21px; font-weight: 700; letter-spacing: .3px; }
-  .status-row { display: flex; align-items: center; gap: 9px; margin-top: 9px; }
+  /* ---- sidebar ---- */
+  .sidebar {
+    width: 216px; flex: 0 0 auto; background: #17181A;
+    display: flex; flex-direction: column; border-right: 1px solid #26272B;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 18px 16px 16px; }
+  .brand-mark {
+    width: 32px; height: 32px; border-radius: 8px; flex: 0 0 auto;
+    background: linear-gradient(135deg, #6C5CE7, #8E7CF0);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 15px; color: #fff;
+  }
+  .brand-name { font-size: 15px; font-weight: 700; letter-spacing: .2px; }
+
+  .nav { flex: 1; padding: 6px 10px; overflow-y: auto; }
+  .nav-item {
+    display: block; width: 100%; text-align: left; background: transparent; border: none;
+    color: #A6A9B2; padding: 9px 13px; border-radius: 7px; font-size: 13.5px;
+    cursor: pointer; transition: background .14s, color .14s; margin-bottom: 2px;
+  }
+  .nav-item:hover { background: #222327; color: #EDEFF3; }
+  .nav-item.active { background: #6C5CE7; color: #fff; font-weight: 600; }
+
+  .sidebar-foot { padding: 12px 14px; border-top: 1px solid #26272B; }
+  .mini-status { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .mini-status-text {
+    font-size: 12px; color: #8B8E95; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; flex: 1; min-width: 0;
+  }
+  .foot-btns { display: flex; gap: 8px; }
+  .foot-btn {
+    flex: 1; background: #222327; border: 1px solid #2E2F33; color: #B8BCC4;
+    padding: 7px 4px; border-radius: 6px; cursor: pointer; font-size: 12px;
+    transition: background .14s, color .14s, border-color .14s;
+  }
+  .foot-btn:hover { background: #2B2D32; color: #EDEFF3; }
+  .foot-btn.danger:hover { border-color: #5A2E2E; color: #FF7A7A; }
+
+  /* ---- main ---- */
+  .main { flex: 1; overflow-y: auto; background: #1E1F22; }
+  .section { display: none; padding: 26px 30px 36px; max-width: 960px; }
+  .section.active { display: block; animation: fadeIn .16s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+  .sec-title { font-size: 19px; font-weight: 700; margin-bottom: 16px; letter-spacing: .2px; }
+
+  /* ---- status dots ---- */
   .dot { width: 11px; height: 11px; border-radius: 50%; background: #8B8E95; flex: 0 0 auto; }
   .dot.ok   { background: #3DDC6F; }
   .dot.warn { background: #FF5C5C; }
-  .dot.busy { background: #F0A030; }
-  .status { color: #B8BCC4; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+  .dot.busy { background: #F0A030; animation: pulse 1.2s ease-in-out infinite; }
+  .dot.lg  { width: 14px; height: 14px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .status { color: #B8BCC4; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+  .status.lg { font-size: 15px; color: #EDEFF3; }
 
-  /* cards */
+  /* ---- cards ---- */
   .card {
     background: #242529; border: 1px solid #302F34; border-left: 3px solid #6C5CE7;
-    border-radius: 10px; padding: 15px 16px; margin-bottom: 13px;
+    border-radius: 10px; padding: 16px 18px; margin-bottom: 14px;
+    transition: border-color .15s;
   }
-  .card h2 { font-size: 13px; font-weight: 600; color: #B8BCC4; letter-spacing: .4px; margin-bottom: 11px; }
+  .card h2 { font-size: 13px; font-weight: 600; color: #B8BCC4; letter-spacing: .4px; margin-bottom: 12px; }
   .label { color: #8B8E95; font-size: 12px; margin-bottom: 6px; }
   .hint { color: #8B8E95; font-size: 12px; margin-top: 8px; line-height: 1.4; }
+
+  /* overview */
+  .hero .status-row { display: flex; align-items: center; gap: 12px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+  .stat { border-left-width: 3px; padding: 14px 16px; margin-bottom: 0; cursor: default; }
+  .stat:hover { transform: translateY(-2px); border-color: #3C3C46; }
+  .stat-label { color: #8B8E95; font-size: 12px; margin-bottom: 6px; }
+  .stat-value { font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
 
   /* forms */
   input[type=text], input[type=password] {
     width: 100%; background: #2B2D32; border: 1px solid #3A3B40; color: #EDEFF3;
-    border-radius: 6px; padding: 9px 11px; font-size: 13px; margin-bottom: 8px;
-    outline: none; transition: border-color .12s;
+    border-radius: 6px; padding: 9px 11px; font-size: 13px; margin-bottom: 9px;
+    outline: none; transition: border-color .12s, box-shadow .12s;
   }
-  input:focus { border-color: #6C5CE7; }
+  input:focus { border-color: #6C5CE7; box-shadow: 0 0 0 3px rgba(108,92,231,.16); }
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   .grow { flex: 2; }
 
   button {
     background: #6C5CE7; color: #fff; border: none; border-radius: 6px;
-    padding: 9px 14px; font-size: 13px; cursor: pointer; transition: background .15s, opacity .15s;
+    padding: 9px 14px; font-size: 13px; cursor: pointer; transition: background .15s, opacity .15s, transform .06s;
     white-space: nowrap;
   }
   button:hover:not(:disabled) { background: #7D6FF0; }
-  button:active:not(:disabled) { background: #5A4BD1; }
+  button:active:not(:disabled) { background: #5A4BD1; transform: translateY(1px); }
   button:disabled { opacity: .4; cursor: default; }
   button.ghost { background: transparent; border: 1px solid #3A3B40; color: #B8BCC4; }
   button.ghost:hover:not(:disabled) { background: #2B2D32; }
@@ -66,15 +121,16 @@
   .code {
     font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; color: #EDEFF3;
     background: #2B2D32; border: 1px solid #3A3B40; border-radius: 6px; padding: 9px 11px;
-    overflow-wrap: anywhere; margin-bottom: 9px;
+    overflow-wrap: anywhere; margin-bottom: 10px;
   }
 
   /* friend list */
   .friend {
-    display: flex; align-items: center; gap: 9px; padding: 9px 0;
-    border-bottom: 1px solid #2C2D31; transition: background .15s;
+    display: flex; align-items: center; gap: 9px; padding: 9px 8px;
+    border-bottom: 1px solid #2C2D31; border-radius: 6px; transition: background .14s;
   }
   .friend:last-child { border-bottom: none; }
+  .friend:hover { background: #2A2B30; }
   .friend .name { flex: 1; font-size: 13px; overflow-wrap: anywhere; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; flex: 0 0 auto; }
   .badge.connected  { background: #17351F; color: #3DDC6F; }
@@ -91,103 +147,155 @@
   .btn-bar { display: flex; gap: 8px; flex-wrap: wrap; }
   .btn-bar button { flex: 1 1 auto; min-width: 0; }
   .game-state { font-size: 12px; color: #8B8E95; margin-top: 9px; line-height: 1.4; overflow-wrap: anywhere; }
+
+  /* narrow window: sidebar becomes a top bar */
+  @media (max-width: 720px) {
+    .shell { flex-direction: column; }
+    .sidebar { width: 100%; flex-direction: row; align-items: center; border-right: none; border-bottom: 1px solid #26272B; }
+    .brand { padding: 10px 12px; }
+    .brand-name { display: none; }
+    .nav { display: flex; flex-direction: row; padding: 0; overflow-x: auto; }
+    .nav-item { width: auto; padding: 8px 12px; white-space: nowrap; }
+    .sidebar-foot { display: none; }
+    .section { padding: 18px 16px 28px; }
+    .stat-grid { grid-template-columns: repeat(2, 1fr); }
+  }
 </style>
 </head>
 <body>
-<div class="app">
-  <header class="header">
-    <div class="title-row">
-      <span class="title">Eliauk VPN</span>
-      <button class="ghost small" id="quitTop">退出</button>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">E</span>
+      <span class="brand-name">Eliauk VPN</span>
     </div>
-    <div class="status-row">
-      <span class="dot" id="dot"></span>
-      <span class="status" id="status">加载中…</span>
-    </div>
-  </header>
-
-  <section class="card" id="accountCard">
-    <h2>账号</h2>
-    <!-- login form (shown when logged out) -->
-    <div id="loginForm">
-      <input type="text" id="user" placeholder="用户名 / 账号">
-      <input type="password" id="pass" placeholder="密码">
-      <div class="btn-bar">
-        <button id="loginBtn">登录</button>
-        <button class="ghost" id="registerBtn">注册新账号</button>
+    <nav class="nav">
+      <button class="nav-item active" data-sec="overview">概览</button>
+      <button class="nav-item" data-sec="friends">好友</button>
+      <button class="nav-item" data-sec="room">房间</button>
+      <button class="nav-item" data-sec="game">游戏</button>
+      <button class="nav-item" data-sec="account">账号</button>
+      <button class="nav-item" data-sec="settings">设置</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="mini-status">
+        <span class="dot" id="sideDot"></span>
+        <span class="mini-status-text" id="miniStatus">加载中…</span>
+      </div>
+      <div class="foot-btns">
+        <button class="foot-btn" id="fullscreenBtn" title="全屏 (F11)">全屏</button>
+        <button class="foot-btn danger" id="quitBtn" title="退出 Eliauk VPN">退出</button>
       </div>
     </div>
-    <!-- logged-in state -->
-    <div id="accountInfo" style="display:none;">
-      <div class="label">当前账号</div>
-      <div class="code" id="accountName" style="margin-bottom:9px;"></div>
-      <button class="ghost small" id="logoutBtn">退出登录</button>
-    </div>
-  </section>
+  </aside>
 
-  <section class="card" id="friendsCard">
-    <h2>好友</h2>
-    <div class="label">我的好友码</div>
-    <div class="code" id="code">—</div>
-    <div class="btn-bar" style="margin-bottom:10px;">
-      <button id="copyBtn">复制好友码</button>
-    </div>
-    <input type="text" id="addInput" placeholder="输入好友码或用户名">
-    <div class="btn-bar">
-      <button id="addBtn">添加好友</button>
-    </div>
-    <div class="hint" id="addHint"></div>
-    <div id="friendList" style="margin-top:10px;"></div>
-  </section>
+  <main class="main">
 
-  <section class="card" id="roomCard">
-    <h2>房间</h2>
-    <div id="roomOut">
-      <input type="text" id="joinCode" placeholder="输入房间码加入">
-      <div class="btn-bar">
-        <button id="joinRoomBtn">加入房间</button>
-        <button class="ghost" id="createRoomBtn">创建房间</button>
+    <section class="section active" id="sec-overview">
+      <h1 class="sec-title">概览</h1>
+      <div class="card hero">
+        <div class="status-row">
+          <span class="dot lg" id="dot"></span>
+          <span class="status lg" id="status">加载中…</span>
+        </div>
       </div>
-    </div>
-    <div id="roomIn" style="display:none;">
-      <div class="label" id="roomTitle"></div>
-      <div id="memberList"></div>
-      <div class="btn-bar" style="margin-top:9px;">
-        <button class="ghost" id="leaveRoomBtn">离开房间</button>
+      <div class="stat-grid">
+        <div class="card stat"><div class="stat-label">好友</div><div class="stat-value" id="statFriends">0</div></div>
+        <div class="card stat"><div class="stat-label">房间</div><div class="stat-value" id="statRoom">未加入</div></div>
+        <div class="card stat"><div class="stat-label">游戏</div><div class="stat-value" id="statGame">未运行</div></div>
+        <div class="card stat"><div class="stat-label">账号</div><div class="stat-value" id="statAccount">未登录</div></div>
       </div>
-    </div>
-  </section>
+      <div class="card">
+        <h2>快速上手</h2>
+        <div class="hint" style="margin-top:0;" id="quickHint">先在「设置」里填昵称和服务器地址并保存连接，然后在「账号」注册登录，再把好友码发给朋友即可联机。</div>
+      </div>
+    </section>
 
-  <section class="card" id="gameCard">
-    <h2>游戏（Minecraft 服务器）</h2>
-    <div class="label">Java 路径</div>
-    <input type="text" id="java" placeholder="javaw.exe 路径">
-    <div class="label">服务器 jar 路径</div>
-    <input type="text" id="jar" placeholder="server.jar 路径">
-    <div class="btn-bar" style="margin-top:4px;">
-      <button class="ghost" id="detectBtn">自动检测</button>
-      <button id="startBtn">启动服务器</button>
-      <button class="ghost" id="stopBtn">停止服务器</button>
-    </div>
-    <div class="btn-bar" style="margin-top:8px;">
-      <button class="ghost" id="copyAddrBtn">复制地址</button>
-      <button class="ghost" id="mcAddBtn">添加服务器</button>
-      <button class="ghost" id="launchBtn">启动游戏</button>
-    </div>
-    <div class="game-state" id="gameState"></div>
-  </section>
+    <section class="section" id="sec-friends">
+      <h1 class="sec-title">好友</h1>
+      <div class="card">
+        <div class="label">我的好友码</div>
+        <div class="code" id="code">—</div>
+        <button id="copyBtn">复制好友码</button>
+      </div>
+      <div class="card">
+        <input type="text" id="addInput" placeholder="输入好友码或用户名">
+        <button id="addBtn">添加好友</button>
+        <div class="hint" id="addHint"></div>
+        <div id="friendList" style="margin-top:10px;"></div>
+      </div>
+    </section>
 
-  <section class="card" id="settingsCard">
-    <h2>设置</h2>
-    <div class="label">昵称</div>
-    <input type="text" id="name" placeholder="显示昵称">
-    <div class="label">服务器地址</div>
-    <input type="text" id="server" placeholder="ws://host:port/ws">
-    <div class="btn-bar">
-      <button id="saveBtn">保存并连接</button>
-      <button class="danger" id="quitBtn">退出</button>
-    </div>
-  </section>
+    <section class="section" id="sec-room">
+      <h1 class="sec-title">房间</h1>
+      <div class="card" id="roomOut">
+        <input type="text" id="joinCode" placeholder="输入房间码加入">
+        <div class="btn-bar">
+          <button id="joinRoomBtn">加入房间</button>
+          <button class="ghost" id="createRoomBtn">创建房间</button>
+        </div>
+      </div>
+      <div class="card" id="roomIn" style="display:none;">
+        <div class="label" id="roomTitle"></div>
+        <div id="memberList"></div>
+        <div class="btn-bar" style="margin-top:10px;">
+          <button class="ghost" id="leaveRoomBtn">离开房间</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="sec-game">
+      <h1 class="sec-title">游戏（Minecraft 服务器）</h1>
+      <div class="card">
+        <div class="label">Java 路径</div>
+        <input type="text" id="java" placeholder="javaw.exe 路径">
+        <div class="label">服务器 jar 路径</div>
+        <input type="text" id="jar" placeholder="server.jar 路径">
+        <div class="btn-bar" style="margin-top:4px;">
+          <button class="ghost" id="detectBtn">自动检测</button>
+          <button id="startBtn">启动服务器</button>
+          <button class="ghost" id="stopBtn">停止服务器</button>
+        </div>
+        <div class="btn-bar" style="margin-top:8px;">
+          <button class="ghost" id="copyAddrBtn">复制地址</button>
+          <button class="ghost" id="mcAddBtn">添加服务器</button>
+          <button class="ghost" id="launchBtn">启动游戏</button>
+        </div>
+        <div class="game-state" id="gameState"></div>
+      </div>
+    </section>
+
+    <section class="section" id="sec-account">
+      <h1 class="sec-title">账号</h1>
+      <div class="card">
+        <div id="loginForm">
+          <input type="text" id="user" placeholder="用户名 / 账号">
+          <input type="password" id="pass" placeholder="密码">
+          <div class="btn-bar">
+            <button id="loginBtn">登录</button>
+            <button class="ghost" id="registerBtn">注册新账号</button>
+          </div>
+        </div>
+        <div id="accountInfo" style="display:none;">
+          <div class="label">当前账号</div>
+          <div class="code" id="accountName" style="margin-bottom:10px;"></div>
+          <button class="ghost small" id="logoutBtn">退出登录</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="sec-settings">
+      <h1 class="sec-title">设置</h1>
+      <div class="card">
+        <div class="label">昵称</div>
+        <input type="text" id="name" placeholder="显示昵称">
+        <div class="label">服务器地址</div>
+        <input type="text" id="server" placeholder="ws://host:port/ws">
+        <button id="saveBtn">保存并连接</button>
+      </div>
+    </section>
+
+  </main>
 </div>
 
 <script>
@@ -203,11 +311,33 @@ var setVal = function (id, v) { if (!active(id)) el(id).value = v || ""; };
 
 var STATE_LABEL = { connected: "已连接", connecting: "连接中", online: "在线", offline: "离线" };
 
+// sidebar navigation
+var navs = document.querySelectorAll(".nav-item");
+var sections = document.querySelectorAll(".section");
+function setSection(name) {
+  navs.forEach(function (n) { n.classList.toggle("active", n.getAttribute("data-sec") === name); });
+  sections.forEach(function (sec) { sec.classList.toggle("active", sec.id === "sec-" + name); });
+}
+navs.forEach(function (n) {
+  n.addEventListener("click", function () { setSection(n.getAttribute("data-sec")); });
+});
+
 function render(s) {
-  // status
-  var d = el("dot");
-  d.className = "dot " + (s.status && s.status.dot ? s.status.dot : "");
-  el("status").textContent = (s.status && s.status.text) || "";
+  var st = s.status || {};
+  var cls = "dot " + (st.dot || "");
+  el("dot").className = "dot lg " + (st.dot || "");
+  el("sideDot").className = cls;
+  el("status").textContent = st.text || "";
+  el("miniStatus").textContent = st.text || "";
+  el("miniStatus").title = st.text || "";
+
+  el("fullscreenBtn").textContent = s.fullscreen ? "退出全屏" : "全屏";
+
+  // overview stats
+  el("statFriends").textContent = (s.friends || []).length;
+  el("statRoom").textContent = (s.room && s.room.in) ? s.room.code : "未加入";
+  el("statGame").textContent = (s.game && s.game.running) ? "运行中" : "未运行";
+  el("statAccount").textContent = s.loggedIn ? s.account : "未登录";
 
   // settings
   setVal("name", s.settings && s.settings.name);
@@ -228,10 +358,8 @@ function render(s) {
   el("addHint").textContent = s.addHint || "";
   renderFriends(s.friends || []);
 
-  // room
   renderRoom(s.room || {});
 
-  // game
   setVal("java", s.game && s.game.java);
   setVal("jar", s.game && s.game.jar);
   el("gameState").textContent = (s.game && s.game.state) || "";
@@ -292,7 +420,7 @@ function esc(t) {
 }
 
 // buttons
-el("quitTop").addEventListener("click", function () { window.eliauk.action({ type: "quit" }); });
+el("fullscreenBtn").addEventListener("click", function () { window.eliauk.action({ type: "fullscreen" }); });
 el("quitBtn").addEventListener("click", function () { window.eliauk.action({ type: "quit" }); });
 el("loginBtn").addEventListener("click", function () { window.eliauk.action({ type: "login", user: el("user").value, pass: el("pass").value }); });
 el("registerBtn").addEventListener("click", function () { window.eliauk.action({ type: "register", user: el("user").value, pass: el("pass").value }); });
@@ -313,7 +441,18 @@ el("mcAddBtn").addEventListener("click", function () { window.eliauk.action({ ty
 el("launchBtn").addEventListener("click", function () { window.eliauk.action({ type: "launch" }); });
 el("saveBtn").addEventListener("click", function () { window.eliauk.action({ type: "save", name: el("name").value, server: el("server").value }); });
 
-// keep a copy of the last state for the copy-address button
+// fullscreen: F11 toggles, Escape exits when already fullscreen
+document.addEventListener("keydown", function (e) {
+  if (e.key === "F11") {
+    e.preventDefault();
+    window.eliauk.action({ type: "fullscreen" });
+  } else if (e.key === "Escape" && window._state && window._state.fullscreen) {
+    e.preventDefault();
+    window.eliauk.action({ type: "fullscreen" });
+  }
+});
+
+// keep a copy of the last state for the copy-address + fullscreen handlers
 window.eliauk.render = function (s) {
   if (typeof s === "string") s = JSON.parse(s);
   window._state = s;
